@@ -8,12 +8,12 @@ An Indeo Video 5 (IV50) encoder for FFmpeg (`-c:v indeo5`), written by studying 
 | Path | Contents |
 |---|---|
 | `src/libavcodec/indeo5enc.c` | the encoder |
-| `patches/` | changes to existing FFmpeg files: decoder fixes (`0001`) and build wiring (`0002`) |
-| `scripts/` | `apply.sh` (add to an FFmpeg checkout), `export.sh` (regenerate `src/` and `patches/`), `base-commit` |
+| `patches/` | decoder fixes to existing FFmpeg files |
+| `scripts/` | `apply.sh` (copies the encoder in, applies the patch, registers the codec), `export.sh` (regenerate `src/` and `patches/`), `base-commit` |
 | `tools/` | stream analysis, comparison against Intel's decoder/encoder, regression suite |
 | `docs/` | notes, feature audit versus Intel's encoder, parity and RDO write-ups |
 
-Patches are made against FFmpeg commit `615b07170e30d79ad5906418ea49f81c3cbd8457`.
+The decoder patch is made against FFmpeg commit `615b07170e30d79ad5906418ea49f81c3cbd8457`. The encoder registration is inserted with `sed`, so it does not depend on the FFmpeg version.
 
 ## Build
 

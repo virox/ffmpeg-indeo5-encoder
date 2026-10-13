@@ -5,9 +5,10 @@
 | Path | What |
 |---|---|
 | `ffmpeg/` | FFmpeg git checkout (615b071) with `scripts/apply.sh` applied (not tracked in git) |
-| `patches/0001-*.patch` | decoder changes: `ivi_dsp.c` synthesis fix, access key and transparency-region synthesis in `indeo5.c`/`ivi.c`/`ivi.h` |
-| `patches/0002-*.patch` | build wiring: `allcodecs.c`, `Makefile`, `configure` |
-| `src/libavcodec/indeo5enc.c` | the encoder (canonical copy; `scripts/apply.sh` adds it to an FFmpeg checkout, `scripts/export.sh` regenerates `src/` and `patches/` from a modified `ffmpeg/`) |
+| `patches/0001-*.patch` | decoder changes: `ivi_dsp.c` synthesis fix, access key and transparency-region synthesis in `indeo5.c`/`ivi.c`/`ivi.h` (made against the base commit; may need rebasing on newer FFmpeg) |
+| `src/libavcodec/indeo5enc.c` | the encoder (canonical copy) |
+| `scripts/apply.sh` | copies the encoder into an FFmpeg checkout, applies the patch, and inserts the registration lines (`allcodecs.c`, `Makefile`, `configure`) after the indeo5 decoder entries with `sed`; idempotent |
+| `scripts/export.sh` | regenerates `src/` and `patches/` from the modified `ffmpeg/` checkout |
 | `tools/iv5hdr.py` | dumps IV50 picture/GOP/band headers of an AVI |
 | `tools/checksums.py` | checks frame/band checksums against decoded YVU9 |
 | `tools/avi2frames.py` | extracts AVI video frames as `[u32 size][data]` records |
