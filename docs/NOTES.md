@@ -23,8 +23,12 @@
 | `tools/iv5stat.py`, `tools/ivr2avi.py`, `tools/mbstats.py`, `tools/fn.sh`, `tools/pe_resources.py` | stream statistics, raw-to-AVI, macroblock stats (`IV5_MBSTATS=1 out/ffmpeg_mbstats -v debug -i x.avi -f null - 2>&1 | tools/mbstats.py`), decompiled-function lookup, PE resource dump |
 | `samples/` | Intel-encoded reference files (FFmpeg samples, plus `intro.avi` and `intro_01.avi`) |
 
-Build: `cd ffmpeg && ./configure --disable-x86asm --disable-doc --disable-autodetect && make -j16 ffmpeg`
-(`--disable-x86asm` only because nasm isn't installed.)
+Build (fresh checkout): `git clone https://github.com/FFmpeg/FFmpeg.git ffmpeg && git -C ffmpeg checkout $(. scripts/base-commit; echo $BASE_COMMIT) && scripts/apply.sh ffmpeg`, then
+`cd ffmpeg && ./configure --disable-x86asm --disable-doc --disable-autodetect && make -j16 ffmpeg`
+(`--disable-x86asm` only because nasm isn't installed here; not needed otherwise.)
+
+Workflow: edit the encoder/decoder in the untracked `ffmpeg/` checkout, rebuild and run `tools/regress.sh`, then run `scripts/export.sh` to refresh
+`src/` and `patches/`, update the docs, and commit. Never edit `src/` or `patches/` by hand; `export.sh` overwrites them.
 
 Use: `ffmpeg -i input.mp4 -c:v indeo5 [options] -an output.avi`. Options: `-quant`/`-quality`/`-b:v`, `-g`, `-droppable`, `-luma_bands 1|4`, `-hh_band 0|1` (default 1; scalable diagonal detail), `-tables`, `-aq_strength`, `-me_range`, `-tile_size`, `-null_frames`, `-quick` (Intel's Quick Compress profile), `-transparency none|alpha|range|first_frame` (alpha: yuva420p input; range/first_frame: bgr24 input, range set with `-transparency_lo/-transparency_hi 0xRRGGBB`), `-access_key`, `-checksum`, `-rdo` (auto: 1 offline, 0 quick; 0 disables trellis and RD modes); see `ffmpeg -h encoder=indeo5` and ENCODER_FEATURES.md. Protected clips decode with `ffmpeg -access_key N -i clip.avi …`. Full verification: `tools/regress.sh` (rebuild its checksum-verifying decoder `out/ffmpeg_dbg` with `tools/build_dbg.sh` after decoder changes).
 (the pixel format is converted to yuv410p automatically). Add `-c:a pcm_s16le` for audio like the samples.
