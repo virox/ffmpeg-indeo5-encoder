@@ -1,0 +1,3158 @@
+/*
+ * Indeo Video Interactive v5 compatible encoder
+ *
+ * This file is part of FFmpeg.
+ *
+ * FFmpeg is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * FFmpeg is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with FFmpeg; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ */
+
+/**
+ * @file
+ * Indeo Video Interactive version 5 encoder.
+ *
+ * Produces basic and scalable streams with intra, predicted, droppable and
+ * NULL frames, half-pel motion compensation, tiling, adaptive quantization,
+ * transparency and access keys. Reconstruction uses the decoder's integer
+ * transforms. Offline encoding uses trellis quantization and macroblock
+ * rate-distortion decisions; Quick Compress defaults to the faster path.
+ */
+
+#include "libavutil/intreadwrite.h"
+#include "libavutil/mem.h"
+#include "libavutil/opt.h"
+#include "libavutil/pixdesc.h"
+
+#define BITSTREAM_WRITER_LE
+#include "avcodec.h"
+#include "codec_internal.h"
+#include "encode.h"
+#include "mathops.h"
+#include "put_bits.h"
+#include "ivi.h"
+#include "ivi_dsp.h"
+#include "indeo5data.h"
+
+#define IVI5_NUM_HUFF   8
+#define IVI5_NUM_RVMAPS 9        ///< 0..7 explicit, 8 = default (band flag 0x40 clear)
+#define MAX_LEVEL       8191     ///< largest |level| an escape code can carry
+#define LUT_LEVEL       64       ///< levels covered by the run/level lookup
+
+/* 23-bit GOP header field the FFmpeg decoder skips: an encoder version
+ * stamp. IR50_32.DLL 5.06 (build R.5.06.15.2.44) always writes 0x102C0F
+ * (0x2C = build 44, 0x0F = 15); see ENCODER_FEATURES.md, F-STAMP. */
+#define IVI5_GOP_STAMP  0x102C0F
+#define IVI5_GOP_STAMP_QC 0x11263E   ///< IR50_QC(X).DLL 5.03 (build R.5.03.63/64.2.38)
+
+#define MAX_CORR        61       ///< decoder limit for rvmap correction pairs
+#define MAX_HUFF_ROWS   15       ///< 4-bit row count of a custom codebook
+#define HUFF_CUSTOM     8        ///< BandTables.huff_sel value of a custom codebook
+
+#define MAX_BANDS 6
+
+typedef void (*InvTransformFunc)(const int32_t *in, int16_t *out,
+                                 ptrdiff_t pitch, const uint8_t *flags);
+typedef void (*DCTransformFunc)(const int32_t *in, int16_t *out,
+                                ptrdiff_t pitch, int blk_size);
+typedef void (*McFunc)(int16_t *buf, const int16_t *ref_buf,
+                       ptrdiff_t pitch, int mc_type);
+
+/** same descriptors as the decoder's static block codebooks (ivi.c) */
+static const IVIHuffDesc blk_huff_desc[IVI5_NUM_HUFF] = {
+    {10, {1, 2, 3, 4, 4, 7, 5, 5, 4, 1}},
+    {11, {2, 3, 4, 4, 4, 7, 5, 4, 3, 3, 2}},
+    {12, {2, 4, 5, 5, 5, 5, 6, 4, 4, 3, 1, 1}},
+    {13, {3, 3, 4, 4, 5, 6, 6, 4, 4, 3, 2, 1, 1}},
+    {11, {3, 4, 4, 5, 5, 5, 6, 5, 4, 2, 2}},
+    {13, {3, 4, 5, 5, 5, 5, 6, 4, 3, 3, 2, 1, 1}},
+    {13, {3, 4, 5, 5, 5, 6, 5, 4, 3, 3, 2, 1, 1}},
+    {9,  {3, 4, 4, 5, 5, 5, 6, 5, 5}}
+};
+
+/** same descriptors as the decoder's static macroblock codebooks (ivi.c) */
+static const IVIHuffDesc mb_huff_desc[IVI5_NUM_HUFF] = {
+    {8,  {0, 4, 5, 4, 4, 4, 6, 6}},
+    {12, {0, 2, 2, 3, 3, 3, 3, 5, 3, 2, 2, 2}},
+    {12, {0, 2, 3, 4, 3, 3, 3, 3, 4, 3, 2, 2}},
+    {12, {0, 3, 4, 4, 3, 3, 3, 3, 3, 2, 2, 2}},
+    {13, {0, 4, 4, 3, 3, 3, 3, 2, 3, 3, 2, 1, 1}},
+    {9,  {0, 4, 4, 4, 4, 3, 3, 3, 2}},
+    {10, {0, 4, 4, 4, 4, 3, 3, 2, 2, 2}},
+    {12, {0, 4, 4, 4, 3, 3, 2, 3, 2, 2, 2, 2}}
+};
+
+enum { MB_INTRA = 0, MB_INTER = 1 };
+
+/** Indeo5 frame types */
+enum { FT_INTRA = 0, FT_INTER = 1, FT_INTER_SCAL = 2, FT_INTER_NOREF = 3, FT_NULL = 4 };
+
+/* transparency sources; Intel's TM_ALPHA_CHANNEL, TM_RANGE and TM_FRAME */
+enum { TRANS_NONE = 0, TRANS_ALPHA = 1, TRANS_RANGE = 2, TRANS_FRAME = 3 };
+
+typedef struct HuffCodes {
+    uint16_t code[256];   ///< codeword, already bit-reversed for the LE writer
+    uint8_t  bits[256];   ///< 0 = symbol not representable
+} HuffCodes;
+
+typedef struct RVLut {
+    /** symbol for (run 1..64, level -LUT_LEVEL..LUT_LEVEL), -1 = escape */
+    int16_t sym[65][2 * LUT_LEVEL + 1];
+    int eob_sym, esc_sym;
+} RVLut;
+
+/** entropy coding setup of one band */
+typedef struct BandTables {
+    int rv_sel;                   ///< rvmap 0..7, 8 = default (not signalled)
+    int huff_sel;                 ///< static codebook 0..7 (7 = default, not
+                                  ///< signalled), HUFF_CUSTOM = explicit descriptor
+    IVIHuffDesc desc;             ///< custom codebook descriptor
+    int num_corr;
+    uint8_t corr[2 * MAX_CORR];   ///< rvmap correction (swap) pairs
+    RVLut lut;                    ///< rvmap after corrections
+    HuffCodes hc;                 ///< codewords in use
+    uint64_t bits;                ///< estimated size incl. table side info
+} BandTables;
+
+typedef struct EncBand {
+    int plane, band_num;
+    int width, height;     ///< band size in samples
+    int mb_size, blk_size;
+    int aw, ah;            ///< dimensions padded to whole macroblocks
+    float *buf;            ///< samples to code (pixels - 128 or wavelet coefs)
+    float *prev_src;       ///< source of the previous frame (NULL frame detection)
+    const uint16_t *base;  ///< intra base quant matrix
+    const uint8_t  *scale; ///< intra quant scale table
+    const uint8_t  *scan;
+    const double   *fwd;   ///< forward transform matrix
+    uint8_t fwd_index[64][64]; ///< nonzero entries of each forward-transform row
+    uint8_t fwd_count[64];
+    int *coef_cache[3];    ///< rounded transforms: intra, zero MV, searched MV
+    uint8_t *coef_valid;   ///< cache validity bits per block, reset each frame
+    int16_t (*coef_mv)[2]; ///< vector identifying the searched-MV cache
+    int is_2d;             ///< 2D transform: DC is predicted between blocks
+    InvTransformFunc inv_transform;
+    double   w[64];        ///< pixel-domain energy of each basis function (natural order)
+    DCTransformFunc  dc_transform;
+    int16_t *levels;       ///< quantized coefficients in scan order
+    uint8_t *cbp;          ///< coded block pattern per macroblock
+    int16_t *recon;        ///< decoder-side reconstruction, pitch x aheight
+    int16_t *ref;          ///< reference picture (last I/P reconstruction)
+    int16_t *sref;         ///< last scalable droppable (type 2) reconstruction
+    const int16_t *mcref;  ///< reference used by the current frame
+    int16_t *pred;         ///< motion-compensated prediction of this frame
+    int pitch, aheight;    ///< decoder band buffer dimensions
+    const uint16_t *inter_base;  ///< inter base quant matrix
+    const uint8_t  *inter_scale; ///< inter quant scale table
+    McFunc mc_delta;       ///< decoder MC adding to the residual
+    McFunc mc_no_delta;    ///< decoder MC copying the prediction
+    uint8_t *mb_type;      ///< MB_INTRA / MB_INTER
+    uint8_t *mb_empty;     ///< inter MB without residual, coded as "empty"
+    uint8_t *me_type;      ///< initial SAD modes, retained across RC trials
+    int16_t (*me_mv)[2];   ///< motion-search candidates, retained across RC trials
+    int16_t (*mb_mv)[2];   ///< motion vector per MB (half-pel units)
+    int8_t  *mb_qd;        ///< quantizer delta per MB (luma band 0 only)
+    float   *mb_act;       ///< activity per MB (adaptive quantization)
+    int qdelta;            ///< band codes quantizer deltas (band flag 0x04)
+    int *order;            ///< MB indices in coding order (tile by tile)
+    int *tile_start;       ///< first index into order of each tile (+ end)
+    int ntiles;
+    int inherit;           ///< MB types/MVs inherited from luma band 0
+    int halfpel;           ///< vectors coded in half-pels (else full-pels)
+    unsigned checksum;     ///< sum of reconstructed samples, mod 2^16
+} EncBand;
+
+/** LU factors of the (pentadiagonal) 1D wavelet synthesis matrix */
+typedef struct BandedLU {
+    int n;
+    double *a;             ///< n x 5, entry (i, i+d-2) at a[5*i+d]
+    double *m;             ///< n x 2 elimination multipliers
+} BandedLU;
+
+typedef struct Indeo5EncContext {
+    const AVClass *class;
+    int quant;                    ///< global quantizer, 0..23
+    int quality;                  ///< Intel quality 0..10000, -1 = use quant
+    int droppable;                ///< Intel's I d P d P pattern (type 3 frames)
+    int rc_qmin, rc_qmax;         ///< rate control quantizer range
+    double rc_debt;               ///< bits produced above the budget so far
+    double rc_kratio;             ///< size of key frames relative to P frames
+    double rc_psize, rc_isize;    ///< recent frame sizes in bits (0 = unknown)
+    int rc_q[2];                  ///< last quantizer for key / inter frames
+    int rc_seen[2];               ///< each frame type has an established quantizer
+    float aq;                     ///< adaptive quantization strength
+    float aq_frac;                ///< fraction of MBs given an extra -1 (rate control)
+    int *mb_order;                ///< luma MBs sorted by activity
+    int me_range;                 ///< motion search range in half-pels
+    int frame_idx;                ///< frames since the last key frame
+    int frame_type;               ///< type of the frame being encoded
+    int prev_type;                ///< type of the previous frame
+    HuffCodes mb_huff[IVI5_NUM_HUFF];
+    HuffCodes mb_hc;              ///< MB codebook of the current frame
+    int mb_huff_sel;              ///< 0..6 static, 7 default, HUFF_CUSTOM
+    IVIHuffDesc mb_desc;
+    int tables;                   ///< 0 static, 1 + custom codebooks, 2 + rvmap corrections
+    int tile_size;                ///< 0 = one tile per band, else 64/128/256
+    int null_frames;              ///< code unchanged P frames as NULL frames
+    int quick;                    ///< Intel Quick Compress style: full-pel ME, static tables
+    int transparency;             ///< TRANS_*: source of the transparency plane
+    uint8_t key_lo[4], key_hi[4]; ///< range mode: lowest / highest key colour (RGBA)
+    uint8_t krange[6];            ///< active key range: B lo, hi, G lo, hi, R lo, hi
+    int key_pending;              ///< first_frame mode: derive the range from this frame
+    int force_key;                ///< code the next frame as a key frame
+    int fill_luma;                ///< luma of fully transparent 4x4 blocks
+    uint32_t fill_rgb;            ///< GOP transparency colour, B << 16 | G << 8 | R
+    uint8_t *ypl, *vpl, *upl;     ///< YVU9 planes after the transparency fill
+    uint8_t *vfull, *ufull;       ///< scratch: full resolution chroma
+    int64_t access_key;           ///< Intel access key (copy protection), -1 = off
+    uint8_t *tmask;               ///< opaque (1) / transparent (0) per pixel
+    uint8_t *tbits;               ///< scratch: mask bits in coding order
+    uint8_t *tuniform;            ///< scratch: per transparency tile 0/1 uniform, 2 mixed
+    int checksums;                ///< write frame and band checksums
+    float rdo;                    ///< rate-distortion optimised quantization strength, 0 = off
+    double rdo_cur;               ///< strength used for the frame being coded
+    double rdo_scale;             ///< rate control: factor on rdo when the quantizer is exhausted
+    int luma_bands;               ///< 1 = basic profile, 4 = scalable
+    int hh_band;                  ///< include the diagonal high-frequency luma band
+    int nb_bands;
+    EncBand bands[MAX_BANDS];
+    HuffCodes huff[IVI5_NUM_HUFF];
+    RVLut rvlut[IVI5_NUM_RVMAPS];
+    double fwd8[64 * 64];         ///< 2D slant 8x8
+    double fwd_row8[64 * 64];     ///< 1D slant over rows
+    double fwd_col8[64 * 64];     ///< 1D slant over columns
+    double fwd_id8[64 * 64];      ///< no transform
+    double fwd4[16 * 16];         ///< 2D slant 4x4
+    BandedLU lu_h, lu_v;          ///< wavelet synthesis, horizontal/vertical
+    double *wl_buf;               ///< wavelet intermediate (2*Mh x 2*Mw)
+    double *wl_line;
+    size_t max_size;
+    BandTables rd_tab[MAX_BANDS]; ///< first-pass tables for RDO candidates
+    BandTables *tab;              ///< scratch: tables of the band being written
+} Indeo5EncContext;
+
+static unsigned reverse_bits(unsigned code, int len)
+{
+    unsigned r = 0;
+    for (int i = 0; i < len; i++)
+        r |= ((code >> i) & 1) << (len - 1 - i);
+    return r;
+}
+
+/* Build codewords exactly like ivi_create_huff_from_desc(). */
+static void build_huff(const IVIHuffDesc *cb, HuffCodes *hc)
+{
+    int pos = 0;
+
+    memset(hc->bits, 0, sizeof(hc->bits));
+    for (int i = 0; i < cb->num_rows; i++) {
+        int codes_per_row = 1 << cb->xbits[i];
+        int not_last_row  = i != cb->num_rows - 1;
+        int prefix        = ((1 << i) - 1) << (cb->xbits[i] + not_last_row);
+
+        for (int j = 0; j < codes_per_row && pos < 256; j++, pos++) {
+            int len  = i + cb->xbits[i] + not_last_row;
+            int code = prefix | j;
+            if (!len)
+                len = 1;
+            /* the decoder reads the MSB of a codeword first */
+            hc->code[pos] = reverse_bits(code, len);
+            hc->bits[pos] = len;
+        }
+    }
+}
+
+static void build_rvlut(const RVMapDesc *rv, RVLut *lut)
+{
+    memset(lut->sym, 0xFF, sizeof(lut->sym));
+    lut->eob_sym = rv->eob_sym;
+    lut->esc_sym = rv->esc_sym;
+    for (int s = 255; s >= 0; s--) {
+        int run = rv->runtab[s], val = rv->valtab[s];
+        if (s == rv->eob_sym || s == rv->esc_sym)
+            continue;
+        if (run >= 1 && run <= 64 && val && FFABS(val) <= LUT_LEVEL)
+            lut->sym[run][val + LUT_LEVEL] = s;
+    }
+}
+
+/**
+ * Derive the forward slant transform as the inverse of the decoder's
+ * own inverse transform. The integer inverse transform is linear up
+ * to rounding, so feeding it large impulses yields its basis matrix
+ * with negligible error; that matrix is then inverted.
+ */
+static int build_forward(int n, InvTransformFunc inv, double *fwd)
+{
+    const int N = n * n;
+    const double amp = 8192.0;
+    double a[64][128];
+    int32_t in[64];
+    int16_t out[64];
+    uint8_t flags[8];
+
+    memset(flags, 1, sizeof(flags));
+    /* a = [inverse | identity]; column k of inverse = response to coeff k */
+    for (int k = 0; k < N; k++) {
+        memset(in, 0, sizeof(in));
+        in[k] = amp;
+        inv(in, out, n, flags);
+        for (int i = 0; i < N; i++)
+            a[i][k] = out[i] / amp;
+    }
+    for (int i = 0; i < N; i++)
+        for (int j = 0; j < N; j++)
+            a[i][N + j] = i == j;
+
+    /* Gauss-Jordan with partial pivoting */
+    for (int c = 0; c < N; c++) {
+        int p = c;
+        for (int r = c + 1; r < N; r++)
+            if (fabs(a[r][c]) > fabs(a[p][c]))
+                p = r;
+        if (fabs(a[p][c]) < 1e-9)
+            return AVERROR_BUG;
+        if (p != c)
+            for (int j = 0; j < 2 * N; j++)
+                FFSWAP(double, a[p][j], a[c][j]);
+        for (int j = 2 * N - 1; j >= c; j--)
+            a[c][j] /= a[c][c];
+        for (int r = 0; r < N; r++) {
+            double f = a[r][c];
+            if (r == c || f == 0.0)
+                continue;
+            for (int j = c; j < 2 * N; j++)
+                a[r][j] -= f * a[c][j];
+        }
+    }
+    for (int i = 0; i < N; i++)
+        for (int j = 0; j < N; j++)
+            fwd[i * N + j] = a[i][N + j];
+    return 0;
+}
+
+/**
+ * Factor the 1D wavelet synthesis matrix for 2*m output samples. Unknowns
+ * are interleaved as L0 H0 L1 H1 ..., output sample k is row k, and every
+ * row only touches columns k-2..k+2. Rows are scaled by 8 (the 1D share of
+ * the decoder's final >> 6). Band samples outside the band are replicated,
+ * except that with mirror_end the high band is mirrored at the end
+ * (H[m] = H[m-2]), which is what the Intel decoder does vertically.
+ */
+static int banded_init(BandedLU *lu, int m, int mirror_end)
+{
+    const int n = 2 * m;
+    double *a;
+
+    lu->n = n;
+    lu->a = a = av_calloc(n * 5, sizeof(*a));
+    lu->m = av_calloc(n * 2, sizeof(*lu->m));
+    if (!lu->a || !lu->m)
+        return AVERROR(ENOMEM);
+
+#define LCOL(k) (2 * av_clip(k, 0, m - 1))
+#define HCOL(k) (2 * av_clip(k, 0, m - 1) + 1)
+#define ADD(row, col, v) a[5 * (row) + (col) - (row) + 2] += (v)
+    for (int k = 0; k < m; k++) {
+        /* x[2k]   = 4 L[k] + 2 (H[k-1] + H[k])                  */
+        ADD(2 * k, LCOL(k), 4);
+        ADD(2 * k, HCOL(k - 1), 2);
+        ADD(2 * k, HCOL(k), 2);
+        /* x[2k+1] = 2 (L[k] + L[k+1]) + H[k-1] - 6 H[k] + H[k+1] */
+        ADD(2 * k + 1, LCOL(k), 2);
+        ADD(2 * k + 1, LCOL(k + 1), 2);
+        ADD(2 * k + 1, HCOL(k - 1), 1);
+        ADD(2 * k + 1, HCOL(k), -6);
+        ADD(2 * k + 1, HCOL(k + 1 < m || !mirror_end ? k + 1 : k - 1), 1);
+    }
+#undef ADD
+#undef LCOL
+#undef HCOL
+
+    /* Gaussian elimination without pivoting; no fill-in outside the band */
+    for (int i = 0; i < n; i++) {
+        double p = a[5 * i + 2];
+        if (fabs(p) < 1e-9)
+            return AVERROR_BUG;
+        for (int d = 1; d <= 2 && i + d < n; d++) {
+            int j = i + d;
+            double f = a[5 * j + 2 - d] / p;
+            lu->m[2 * i + d - 1] = f;
+            for (int k = i; k <= FFMIN(i + 2, n - 1); k++)
+                a[5 * j + k - j + 2] -= f * a[5 * i + k - i + 2];
+        }
+    }
+    return 0;
+}
+
+static void banded_solve(const BandedLU *lu, double *b)
+{
+    const int n = lu->n;
+    const double *a = lu->a;
+
+    for (int i = 0; i < n; i++)
+        for (int d = 1; d <= 2 && i + d < n; d++)
+            b[i + d] -= lu->m[2 * i + d - 1] * b[i];
+    for (int i = n - 1; i >= 0; i--) {
+        double v = b[i];
+        for (int k = i + 1; k <= FFMIN(i + 2, n - 1); k++)
+            v -= a[5 * i + k - i + 2] * b[k];
+        b[i] = v / a[5 * i + 2];
+    }
+}
+
+static void banded_free(BandedLU *lu)
+{
+    av_freep(&lu->a);
+    av_freep(&lu->m);
+}
+
+/* Replicate the band edges into the macroblock padding. */
+static void pad_band(EncBand *b)
+{
+    for (int y = 0; y < b->ah; y++) {
+        float *row = b->buf + y * b->aw;
+        if (y >= b->height)
+            memcpy(row, b->buf + (b->height - 1) * b->aw, b->aw * sizeof(*row));
+        else
+            for (int x = b->width; x < b->aw; x++)
+                row[x] = row[b->width - 1];
+    }
+}
+
+/**
+ * One level of wavelet analysis producing the 4 luma bands. This is the
+ * exact inverse of ff_ivi_recompose53() (ignoring its final rounding),
+ * computed separably by solving the 1D synthesis systems.
+ */
+static void wavelet_analysis(Indeo5EncContext *s, const uint8_t *src,
+                             ptrdiff_t stride, int w, int h)
+{
+    const int mw = s->bands[0].width, mh = s->bands[0].height;
+    const int we = 2 * mw, he = 2 * mh;
+    double *t = s->wl_buf, *line = s->wl_line;
+
+    /* rows: horizontal low half then high half; +0.5 compensates the
+     * decoder's truncating >> 6 */
+    for (int y = 0; y < he; y++) {
+        const uint8_t *row = src + FFMIN(y, h - 1) * stride;
+        double *dst = t + y * we;
+        for (int x = 0; x < we; x++)
+            line[x] = 8.0 * (row[FFMIN(x, w - 1)] - 128 + 0.5);
+        banded_solve(&s->lu_h, line);
+        for (int k = 0; k < mw; k++) {
+            dst[k]      = line[2 * k];
+            dst[mw + k] = line[2 * k + 1];
+        }
+    }
+    /* columns */
+    for (int x = 0; x < we; x++) {
+        int hi_h = x >= mw, col = hi_h ? x - mw : x;
+        EncBand *lo = &s->bands[hi_h ? 2 : 0];   /* vertical low  */
+        EncBand *hi = &s->bands[hi_h ? 3 : 1];   /* vertical high */
+        for (int y = 0; y < he; y++)
+            line[y] = 8.0 * t[y * we + x];
+        banded_solve(&s->lu_v, line);
+        for (int k = 0; k < mh; k++) {
+            lo->buf[k * lo->aw + col] = line[2 * k];
+            hi->buf[k * hi->aw + col] = line[2 * k + 1];
+        }
+    }
+    for (int i = 0; i < 4; i++)
+        pad_band(&s->bands[i]);
+
+    /* Intel's MMX synthesis includes HH, as does our default decoder.
+     * Legacy scalar synthesis omits it; allow common reconstruction with
+     * both paths when explicitly requested. */
+    if (!s->hh_band)
+        memset(s->bands[3].buf, 0, s->bands[3].aw * s->bands[3].ah * sizeof(float));
+}
+
+/**
+ * MB coding order: tiles in raster order (as ff_ivi_init_tiles()), MBs in
+ * raster order inside each tile. tw/th = tile size in band samples, 0 = the
+ * whole band.
+ */
+static int build_tiles(EncBand *b, int tw, int th)
+{
+    const int mbs_x = b->aw / b->mb_size;
+    int k = 0, t = 0;
+
+    if (!tw || !th) {
+        tw = b->width;
+        th = b->height;
+    }
+    b->ntiles = ((b->width + tw - 1) / tw) * ((b->height + th - 1) / th);
+    b->order = av_malloc_array((b->aw / b->mb_size) * (b->ah / b->mb_size), sizeof(*b->order));
+    b->tile_start = av_malloc_array(b->ntiles + 1, sizeof(*b->tile_start));
+    if (!b->order || !b->tile_start)
+        return AVERROR(ENOMEM);
+    for (int y = 0; y < b->height; y += th)
+        for (int x = 0; x < b->width; x += tw) {
+            int w = FFMIN(b->width - x, tw), h = FFMIN(b->height - y, th);
+            b->tile_start[t++] = k;
+            if (x % b->mb_size || y % b->mb_size)
+                return AVERROR(EINVAL);
+            for (int my = 0; my < (h + b->mb_size - 1) / b->mb_size; my++)
+                for (int mx = 0; mx < (w + b->mb_size - 1) / b->mb_size; mx++)
+                    b->order[k++] = (y / b->mb_size + my) * mbs_x + x / b->mb_size + mx;
+        }
+    b->tile_start[t] = k;
+    return 0;
+}
+
+static int alloc_band(EncBand *b)
+{
+    int nblk  = (b->aw / b->blk_size) * (b->ah / b->blk_size);
+    int nmbs  = (b->aw / b->mb_size) * (b->ah / b->mb_size);
+    b->buf    = av_malloc_array(b->aw * b->ah, sizeof(*b->buf));
+    b->prev_src = av_calloc(b->aw * b->ah, sizeof(*b->prev_src));
+    b->levels = av_malloc_array(nblk * b->blk_size * b->blk_size,
+                                sizeof(*b->levels));
+    for (int i = 0; i < 3; i++)
+        b->coef_cache[i] = av_malloc_array(nblk * b->blk_size * b->blk_size, sizeof(int));
+    b->coef_valid = av_calloc(nblk, 1);
+    b->coef_mv = av_calloc(nmbs, sizeof(*b->coef_mv));
+    b->cbp    = av_malloc(nmbs);
+    /* like the decoder's band buffers: zeroed, decoder pitch and height */
+    b->recon  = av_calloc(b->pitch * b->aheight, sizeof(*b->recon));
+    b->ref    = av_calloc(b->pitch * b->aheight, sizeof(*b->ref));
+    b->sref   = av_calloc(b->pitch * b->aheight, sizeof(*b->sref));
+    b->pred   = av_calloc(b->pitch * b->aheight, sizeof(*b->pred));
+    b->mb_type  = av_calloc(nmbs, 1);
+    b->mb_empty = av_calloc(nmbs, 1);
+    b->mb_mv    = av_calloc(nmbs, sizeof(*b->mb_mv));
+    b->me_mv    = av_calloc(nmbs, sizeof(*b->me_mv));
+    b->me_type  = av_calloc(nmbs, 1);
+    b->mb_qd    = av_calloc(nmbs, sizeof(*b->mb_qd));
+    b->mb_act   = av_calloc(nmbs, sizeof(*b->mb_act));
+    if (!b->buf || !b->prev_src || !b->levels || !b->coef_cache[0] || !b->coef_cache[1] ||
+        !b->coef_cache[2] || !b->coef_valid || !b->coef_mv || !b->cbp || !b->recon || !b->ref || !b->sref ||
+        !b->pred || !b->mb_type || !b->mb_empty || !b->mb_mv || !b->me_mv || !b->me_type || !b->mb_qd || !b->mb_act)
+        return AVERROR(ENOMEM);
+    return 0;
+}
+
+/* GOP colour of range keyed streams: the middle of the range (FUN_100476f0) */
+static uint32_t key_fill(const uint8_t *k)
+{
+    return (k[0] + k[1]) >> 1 << 16 | (k[2] + k[3]) >> 1 << 8 | (k[4] + k[5]) >> 1;
+}
+
+/* Pixel-domain energy of each basis function of the decoder's inverse
+ * transform, measured with impulses: the distortion weight of an error in
+ * that coefficient (the slant bases are close to orthogonal). */
+static void basis_energy(EncBand *b)
+{
+    const int n = b->blk_size, nc = n * n;
+    const double amp = 4096.0;
+    int32_t in[64];
+    int16_t out[64];
+    uint8_t flags[8];
+
+    memset(flags, 1, sizeof(flags));
+    for (int k = 0; k < nc; k++) {
+        double e = 0;
+        memset(in, 0, sizeof(in));
+        in[k] = amp;
+        b->inv_transform(in, out, n, flags);
+        for (int i = 0; i < nc; i++)
+            e += (out[i] / amp) * (out[i] / amp);
+        b->w[k] = e;
+    }
+}
+
+static av_cold int encode_init(AVCodecContext *avctx)
+{
+    Indeo5EncContext *s = avctx->priv_data;
+    int ret;
+
+    if (avctx->width > 8191 || avctx->height > 8191 ||
+        avctx->width < 4 || avctx->height < 4) {
+        av_log(avctx, AV_LOG_ERROR, "Unsupported dimensions %dx%d\n",
+               avctx->width, avctx->height);
+        return AVERROR(EINVAL);
+    }
+
+    if ((avctx->width & 3) || (avctx->height & 3) ||
+        avctx->width < 32 || avctx->height < 32 ||
+        (int64_t)avctx->width * avctx->height > 1 << 22)
+        av_log(avctx, AV_LOG_WARNING, "%dx%d: Intel's IR50_32.DLL only handles "
+               "multiples of 4 between 32x32 and 4 Mpixels; the stream may not "
+               "play with the original codec\n", avctx->width, avctx->height);
+
+    for (int i = 0; i < IVI5_NUM_HUFF; i++) {
+        build_huff(&blk_huff_desc[i], &s->huff[i]);
+        build_huff(&mb_huff_desc[i], &s->mb_huff[i]);
+    }
+    for (int i = 0; i < IVI5_NUM_RVMAPS; i++)
+        build_rvlut(&ff_ivi_rvmap_tabs[i], &s->rvlut[i]);
+
+    if ((ret = build_forward(8, ff_ivi_inverse_slant_8x8, s->fwd8)) < 0 ||
+        (ret = build_forward(4, ff_ivi_inverse_slant_4x4, s->fwd4)) < 0)
+        return ret;
+
+    if ((ret = build_forward(8, ff_ivi_row_slant8, s->fwd_row8)) < 0 ||
+        (ret = build_forward(8, ff_ivi_col_slant8, s->fwd_col8)) < 0 ||
+        (ret = build_forward(8, ff_ivi_put_pixels_8x8, s->fwd_id8)) < 0)
+        return ret;
+
+    /* Intel's mapping from the VfW quality (0..10000) to the quantizer,
+     * measured with IR50_32.DLL (ENCODER_FEATURES.md, F-Q) */
+    /* Quick Compress rounds the other way (measured with IR50_QC.DLL) */
+    if (s->quality >= 0)
+        s->quant = (23 * (10000 - s->quality) + (s->quick ? 0 : 9999)) / 10000;
+    if (s->quick) {
+        /* IR50_QC(X).DLL: full-pel vectors (+-14 pixels, +-7 in the
+         * scalable LL band), static block/MB codebook 3, default rvmap,
+         * no checksums, quantizer deltas signalled (all zero) */
+        s->tables   = 0;
+        s->me_range = s->luma_bands == 4 ? 14 : 28;
+    }
+    if (s->rdo < 0)                  /* Quick Compress is about speed */
+        s->rdo = s->quick ? 0 : 1;
+    s->rdo_scale = 1;
+    if (s->checksums < 0)            /* Quick Compress writes none */
+        s->checksums = !s->quick || s->access_key >= 0;
+    /* A useful initial reference needs more bits than a predicted frame.
+     * Start near the measured offline ratio, then learn it from this clip. */
+    s->rc_kratio = 8;
+    if (s->rc_qmin > s->rc_qmax) {
+        av_log(avctx, AV_LOG_ERROR, "rc_qmin must not exceed rc_qmax\n");
+        return AVERROR(EINVAL);
+    }
+    s->rc_q[0] = s->rc_q[1] = av_clip(s->quant, s->rc_qmin, s->rc_qmax);
+
+    if (s->luma_bands != 1 && s->luma_bands != 4) {
+        av_log(avctx, AV_LOG_ERROR, "luma_bands must be 1 or 4\n");
+        return AVERROR(EINVAL);
+    }
+
+    s->mb_order = av_malloc_array((FFALIGN(avctx->width, 8) / 8) * (FFALIGN(avctx->height, 8) / 8),
+                                  sizeof(*s->mb_order));
+    if (s->access_key >= 0 && !s->checksums) {
+        av_log(avctx, AV_LOG_ERROR, "access_key needs checksums (the lock word depends on them)\n");
+        return AVERROR(EINVAL);
+    }
+    if (s->transparency) {
+        size_t npix = (size_t)avctx->width * avctx->height;
+        size_t ncpix = (size_t)((avctx->width + 3) >> 2) * ((avctx->height + 3) >> 2);
+        enum AVPixelFormat want = s->transparency == TRANS_ALPHA ? AV_PIX_FMT_YUVA420P
+                                                                 : AV_PIX_FMT_BGR24;
+        if (avctx->pix_fmt != want) {
+            av_log(avctx, AV_LOG_ERROR, "this transparency mode needs %s input\n",
+                   av_get_pix_fmt_name(want));
+            return AVERROR(EINVAL);
+        }
+        if (s->transparency == TRANS_RANGE) {
+            /* options are RGBA, the key range is B, G, R as in Intel's
+             * rngTransparencyRange */
+            for (int c = 0; c < 3; c++) {
+                s->krange[2 * c]     = s->key_lo[2 - c];
+                s->krange[2 * c + 1] = s->key_hi[2 - c];
+                if (s->krange[2 * c] > s->krange[2 * c + 1]) {
+                    av_log(avctx, AV_LOG_ERROR, "transparency_lo must not exceed "
+                           "transparency_hi in any component\n");
+                    return AVERROR(EINVAL);
+                }
+            }
+            s->fill_rgb = key_fill(s->krange);
+        } else {
+            s->key_pending = s->transparency == TRANS_FRAME;
+            s->fill_rgb    = 0x808080;   /* Intel's grey until a range is known */
+        }
+        s->fill_luma = 128;
+        s->tmask = av_malloc(npix);
+        s->tbits = av_malloc(FFALIGN(avctx->width, 32) * avctx->height);
+        s->tuniform = av_malloc(npix / (64 * 64) + 2 * ((avctx->width + avctx->height) / 64) + 4);
+        s->ypl   = av_malloc(npix);
+        s->vfull = av_malloc(npix);
+        s->ufull = av_malloc(npix);
+        s->vpl   = av_malloc(ncpix);
+        s->upl   = av_malloc(ncpix);
+        /* transparency plane, worst case: a 13-bit run symbol per pixel */
+        s->max_size += FFALIGN(avctx->width, 32) * avctx->height * 2 + 4096;
+        if (!s->tmask || !s->tbits || !s->tuniform || !s->ypl || !s->vfull || !s->ufull || !s->vpl || !s->upl)
+            return AVERROR(ENOMEM);
+    }
+    s->tab = av_mallocz(sizeof(*s->tab));
+    if (!s->mb_order)
+        return AVERROR(ENOMEM);
+    if (!s->tab)
+        return AVERROR(ENOMEM);
+
+    /* luma bands, then one band per chroma plane (V, then U) */
+    s->nb_bands = s->luma_bands + 2;
+    s->max_size += 1024;           /* headers */
+    for (int i = 0; i < s->nb_bands; i++) {
+        EncBand *b = &s->bands[i];
+        int p = i < s->luma_bands ? 0 : i - s->luma_bands + 1;
+
+        b->plane    = p;
+        b->band_num = p ? 0 : i;
+        if (p) {
+            b->width    = (avctx->width  + 3) >> 2;
+            b->height   = (avctx->height + 3) >> 2;
+            b->blk_size = 4;
+            /* Quick Compress: MB = block in the scalable layout */
+            b->mb_size  = s->luma_bands == 4 && !s->quick ? 8 : 4;
+            b->base     = ivi5_base_quant_4x4_intra;
+            b->scale    = ivi5_scale_quant_4x4_intra;
+            b->inter_base  = ivi5_base_quant_4x4_inter;
+            b->inter_scale = ivi5_scale_quant_4x4_inter;
+            b->mc_delta    = ff_ivi_mc_4x4_delta;
+            b->mc_no_delta = ff_ivi_mc_4x4_no_delta;
+            b->inherit     = 1;
+            b->scan     = ff_ivi_direct_scan_4x4;
+            b->fwd      = s->fwd4;
+            b->is_2d    = 1;
+            b->inv_transform = ff_ivi_inverse_slant_4x4;
+            b->dc_transform  = ff_ivi_dc_slant_2d;
+        } else {
+            /* the decoder selects quant matrix 0 for a lone luma band,
+             * band_num + 1 in the scalable layout */
+            int qm = s->luma_bands == 4 ? b->band_num + 1 : 0;
+
+            b->width    = s->luma_bands == 4 ? (avctx->width  + 1) >> 1 : avctx->width;
+            b->height   = s->luma_bands == 4 ? (avctx->height + 1) >> 1 : avctx->height;
+            b->blk_size = 8;
+            b->mb_size  = s->luma_bands == 4 && s->quick ? 8 : 16;
+            b->base     = ivi5_base_quant_8x8_intra[qm];
+            b->scale    = ivi5_scale_quant_8x8_intra[qm];
+            b->inter_base  = ivi5_base_quant_8x8_inter[qm];
+            b->inter_scale = ivi5_scale_quant_8x8_inter[qm];
+            b->mc_delta    = ff_ivi_mc_8x8_delta;
+            b->mc_no_delta = ff_ivi_mc_8x8_no_delta;
+            b->inherit     = b->band_num != 0;
+            switch (b->band_num) {
+            case 0:
+                b->scan  = ff_zigzag_direct;
+                b->fwd   = s->fwd8;
+                b->is_2d = 1;
+                b->inv_transform = ff_ivi_inverse_slant_8x8;
+                b->dc_transform  = ff_ivi_dc_slant_2d;
+                break;
+            case 1:
+                b->scan  = ff_ivi_vertical_scan_8x8;
+                b->fwd   = s->fwd_row8;
+                b->inv_transform = ff_ivi_row_slant8;
+                b->dc_transform  = ff_ivi_dc_row_slant;
+                break;
+            case 2:
+                b->scan  = ff_ivi_horizontal_scan_8x8;
+                b->fwd   = s->fwd_col8;
+                b->inv_transform = ff_ivi_col_slant8;
+                b->dc_transform  = ff_ivi_dc_col_slant;
+                break;
+            case 3:
+                b->scan  = ff_ivi_horizontal_scan_8x8;
+                b->fwd   = s->fwd_id8;
+                b->inv_transform = ff_ivi_put_pixels_8x8;
+                b->dc_transform  = ff_ivi_put_dc_pixel_8x8;
+                break;
+            }
+        }
+        b->aw = FFALIGN(b->width,  b->mb_size);
+        /* Preserve the dense transform's summation order while skipping
+         * exact zero entries (especially identity and 1D band transforms). */
+        for (int j = 0; j < b->blk_size * b->blk_size; j++)
+            for (int k = 0; k < b->blk_size * b->blk_size; k++)
+                if (b->fwd[j * b->blk_size * b->blk_size + k] != 0)
+                    b->fwd_index[j][b->fwd_count[j]++] = k;
+        b->halfpel = !s->quick;
+        basis_energy(b);
+        b->ah = FFALIGN(b->height, b->mb_size);
+        /* ff_ivi_init_planes(): luma bands aligned to 16, chroma to 8 */
+        b->pitch   = FFALIGN(b->width,  p ? 8 : 16);
+        b->aheight = FFALIGN(b->height, p ? 8 : 16);
+        if ((ret = alloc_band(b)) < 0)
+            return ret;
+        /* worst case: every coefficient escape coded, 4 codes of <= 13 bits */
+        s->max_size += (size_t)b->aw * b->ah * 7 + 64;
+    }
+
+    if (s->tile_size && s->tile_size != 64 && s->tile_size != 128 && s->tile_size != 256) {
+        av_log(avctx, AV_LOG_ERROR, "tile_size must be 0, 64, 128 or 256\n");
+        return AVERROR(EINVAL);
+    }
+    for (int i = 0; i < s->nb_bands; i++) {
+        EncBand *b = &s->bands[i];
+        /* tile dimensions per band as in ff_ivi_init_tiles() */
+        int t = s->tile_size;
+        if (t) {
+            if (b->plane)
+                t = (t + 3) >> 2;
+            else if (s->luma_bands == 4)
+                t >>= 1;
+        }
+        if ((ret = build_tiles(b, t, t)) < 0) {
+            av_log(avctx, AV_LOG_ERROR, "tile size %d does not fit the %dx%d macroblock grid\n",
+                   s->tile_size, b->mb_size, b->mb_size);
+            return ret;
+        }
+        if (i && (b->ntiles != s->bands[0].ntiles))
+            return AVERROR(EINVAL);
+        for (int k = 0; i && k <= b->ntiles; k++)
+            if (b->tile_start[k] != s->bands[0].tile_start[k]) {
+                av_log(avctx, AV_LOG_ERROR, "Macroblock count mismatch between bands' tiles\n");
+                return AVERROR(EINVAL);
+            }
+    }
+
+    /* the decoder requires every band's tile to have as many macroblocks
+     * as the first luma band (it serves as reference for MVs/quant) */
+    for (int i = 1; i < s->nb_bands; i++)
+        if (s->bands[i].aw / s->bands[i].mb_size != s->bands[0].aw / s->bands[0].mb_size ||
+            s->bands[i].ah / s->bands[i].mb_size != s->bands[0].ah / s->bands[0].mb_size) {
+            av_log(avctx, AV_LOG_ERROR, "Macroblock grid mismatch for %dx%d\n",
+                   avctx->width, avctx->height);
+            return AVERROR(EINVAL);
+        }
+
+    if (s->luma_bands == 4) {
+        int mw = s->bands[0].width, mh = s->bands[0].height;
+        /* horizontally Intel overwrites the last odd column with its left
+         * neighbour (not invertible), so the plain replicating model is
+         * used there */
+        if ((ret = banded_init(&s->lu_h, mw, 0)) < 0 ||
+            (ret = banded_init(&s->lu_v, mh, 1)) < 0)
+            return ret;
+        s->wl_buf  = av_malloc_array(4 * mw * mh, sizeof(*s->wl_buf));
+        s->wl_line = av_malloc_array(2 * FFMAX(mw, mh), sizeof(*s->wl_line));
+        if (!s->wl_buf || !s->wl_line)
+            return AVERROR(ENOMEM);
+    }
+
+    return 0;
+}
+
+/* Copy one plane into a band buffer, removing the 128 bias and
+ * replicating the edges into the macroblock padding. */
+static void load_band(EncBand *b, const uint8_t *src, ptrdiff_t stride)
+{
+    for (int y = 0; y < b->ah; y++) {
+        const uint8_t *row = src + FFMIN(y, b->height - 1) * stride;
+        float *dst = b->buf + y * b->aw;
+        for (int x = 0; x < b->aw; x++)
+            dst[x] = row[FFMIN(x, b->width - 1)] - 128;
+    }
+}
+
+/*
+ * First-frame analysis of IR50_32.DLL (FUN_1001c6a0): per channel, the
+ * levels below which and above which 1/500 of the pixels lie, widened by
+ * half the spread at the top and then at the bottom. The first frame is
+ * expected to show only the backdrop.
+ */
+static void analyse_key(Indeo5EncContext *s, const AVFrame *f, int w, int h)
+{
+    unsigned hist[3][256] = { { 0 } };
+    unsigned thr = (unsigned)(w * h) / 500;
+
+    for (int y = 0; y < h; y++) {
+        const uint8_t *p = f->data[0] + y * f->linesize[0];
+        for (int x = 0; x < w; x++, p += 3)
+            for (int c = 0; c < 3; c++)
+                hist[c][p[c]]++;
+    }
+    for (int c = 0; c < 3; c++) {
+        unsigned sum = 0;
+        int lo, hi;
+        for (lo = 0; lo < 256 && (sum += hist[c][lo]) < thr; lo++)
+            ;
+        for (sum = 0, hi = 255; hi >= 0 && (sum += hist[c][hi]) < thr; hi--)
+            ;
+        hi = FFMIN(hi + ((hi - lo) >> 1), 255);
+        lo = FFMAX(lo - ((hi - lo) >> 1), 0);
+        s->krange[2 * c]     = lo;
+        s->krange[2 * c + 1] = hi;
+    }
+}
+
+/*
+ * Transparency mask and YVU9 planes, as IR50_32.DLL prepares them
+ * (FUN_1001a6d0, FUN_1001c220): the mask comes from the alpha channel or
+ * from the key colour range (BGR input, a pixel is transparent when all three
+ * components lie within the range). Chroma is a weighted 4x4 average (3/5/25)
+ * of the opaque pixels. In partly transparent 4x4 blocks the transparent
+ * pixels take the mean luma of the opaque ones; fully transparent blocks get
+ * grey chroma and a fill luma that follows the mean opaque luma when it moves
+ * away by more than 23. All of this keeps hidden areas cheap to code.
+ */
+static void prepare_transparent(Indeo5EncContext *s, const AVFrame *f, int w, int h)
+{
+    static const uint8_t wt[16] = { 3, 5, 5, 3, 5, 25, 25, 5, 5, 25, 25, 5, 3, 5, 5, 3 };
+    const int cw = (w + 3) >> 2, ch = (h + 3) >> 2;
+    const uint8_t *k = s->krange;
+    int64_t ysum = 0;
+    int nop = 0, avg;
+
+    if (s->transparency != TRANS_ALPHA && s->key_pending) {
+        analyse_key(s, f, w, h);
+        s->fill_rgb    = key_fill(s->krange);
+        s->key_pending = 0;
+        s->force_key   = 1;      /* Intel codes the frame after it as a key frame */
+    }
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            int i = y * w + x, o;
+            if (s->transparency == TRANS_ALPHA) {
+                o = f->data[3][y * f->linesize[3] + x] >= 128;
+                s->ypl[i]   = f->data[0][y * f->linesize[0] + x];
+                s->vfull[i] = f->data[2][(y >> 1) * f->linesize[2] + (x >> 1)];
+                s->ufull[i] = f->data[1][(y >> 1) * f->linesize[1] + (x >> 1)];
+            } else {
+                const uint8_t *p = f->data[0] + y * f->linesize[0] + 3 * x;
+                int b = p[0], g = p[1], r = p[2];
+                o = b < k[0] || b > k[1] || g < k[2] || g > k[3] || r < k[4] || r > k[5];
+                /* BT.601 studio range: Intel's tables agree to within 1 */
+                s->ypl[i]   = (( 66 * r + 129 * g +  25 * b + 128) >> 8) +  16;
+                s->vfull[i] = ((112 * r -  94 * g -  18 * b + 128) >> 8) + 128;
+                s->ufull[i] = ((-38 * r -  74 * g + 112 * b + 128) >> 8) + 128;
+            }
+            s->tmask[i] = o;
+            if (o) {
+                ysum += s->ypl[i];
+                nop++;
+            }
+        }
+
+    avg = ysum / (nop + 1);
+    if (FFABS(avg - s->fill_luma) > 23 && nop >= (w * h) >> 6)
+        s->fill_luma = avg;
+
+    for (int by = 0; by < ch; by++)
+        for (int bx = 0; bx < cw; bx++) {
+            int sv = 0, su = 0, sy = 0, ws = 0, n = 0;
+            for (int j = 0; j < 16; j++) {
+                int i = FFMIN(4 * by + (j >> 2), h - 1) * w + FFMIN(4 * bx + (j & 3), w - 1);
+                if (s->tmask[i]) {
+                    /* the weights go to the opaque pixels in turn (as Intel) */
+                    sv += s->vfull[i] * wt[n];
+                    su += s->ufull[i] * wt[n];
+                    sy += s->ypl[i];
+                    ws += wt[n++];
+                }
+            }
+            if (ws) {
+                s->vpl[by * cw + bx] = (sv + (ws >> 1)) / ws;
+                s->upl[by * cw + bx] = (su + (ws >> 1)) / ws;
+            } else {
+                s->vpl[by * cw + bx] = s->upl[by * cw + bx] = 128;
+            }
+            if (n == 16)
+                continue;
+            for (int y = 4 * by; y < FFMIN(4 * by + 4, h); y++)
+                for (int x = 4 * bx; x < FFMIN(4 * bx + 4, w); x++)
+                    if (!s->tmask[y * w + x])
+                        s->ypl[y * w + x] = n ? (sy + (n >> 1)) / n : s->fill_luma;
+        }
+}
+
+static int quantize(int coef, int q)
+{
+    int a = FFABS(coef), l;
+
+    if (q <= 1) {
+        l = a;
+    } else {
+        /* decoder: rec = l*q + ((q^1)-1)>>1, for l != 0 */
+        int off = ((q ^ 1) - 1) >> 1;
+        if (2 * a < q + off) {
+            l = 0;      /* closer to zero than to the first level */
+        } else {
+            l = (a - off + (q >> 1)) / q;
+            l = FFMAX(l, 1);
+        }
+    }
+    l = FFMIN(l, MAX_LEVEL);
+    return coef < 0 ? -l : l;
+}
+
+static int dequantize(int l, int q)
+{
+    /* zero levels are never transmitted, so never get the rounding offset */
+    if (q > 1 && l)
+        l = l * q + FFSIGN(l) * (((q ^ 1) - 1) >> 1);
+    return l;
+}
+
+/** reference pointer and MC type for a block, as computed by ivi_mc() */
+static const int16_t *mc_source(const EncBand *b, int x0, int y0,
+                                const int16_t *mv, int *mc_type)
+{
+    int mvx = mv[0], mvy = mv[1];
+    /* all bands are coded with half-pel motion vectors */
+    *mc_type = ((mvy & 1) << 1) | (mvx & 1);
+    mvx >>= 1;
+    mvy >>= 1;
+    return b->mcref + (y0 + mvy) * b->pitch + x0 + mvx;
+}
+
+/* Fill b->pred with the motion-compensated prediction of all inter MBs. */
+static void predict_band(EncBand *b)
+{
+    const int bs = b->blk_size;
+    const int mbs_x = b->aw / b->mb_size, mbs_y = b->ah / b->mb_size;
+    const int blks  = b->mb_size != bs ? 4 : 1;
+
+    for (int my = 0; my < mbs_y; my++)
+        for (int mx = 0; mx < mbs_x; mx++) {
+            int m = my * mbs_x + mx;
+            if (b->mb_type[m] != MB_INTER)
+                continue;
+            for (int blk = 0; blk < blks; blk++) {
+                int x0 = mx * b->mb_size + (blk & 1) * bs;
+                int y0 = my * b->mb_size + (blk >> 1) * bs;
+                int mc_type;
+                const int16_t *src = mc_source(b, x0, y0, b->mb_mv[m], &mc_type);
+                b->mc_no_delta(b->pred + y0 * b->pitch + x0, src, b->pitch, mc_type);
+            }
+        }
+}
+
+/* Code lengths of the band's chosen run/level map and codebook, for the
+ * rate-distortion optimised quantization. */
+typedef struct RDOCtx {
+    const RVLut *lut;
+    uint8_t len[256];            ///< 0 = symbol not codable
+    double k;                    ///< lambda = k * mean(basis energy * step^2)
+} RDOCtx;
+
+/* Bits of the (run, level) pair, INT_MAX if it cannot be coded. */
+static int rdo_bits(const RDOCtx *r, int run, int l)
+{
+    int s = FFABS(l) <= LUT_LEVEL && run < 64 ? r->lut->sym[run + 1][l + LUT_LEVEL] : -1;
+    if (s >= 0)
+        return r->len[s] ? r->len[s] : INT_MAX;
+    {
+        int u = l > 0 ? 2 * l - 1 : -2 * l;
+        int a, b, c, d;
+        if ((unsigned)(u >> 6) >= 256)
+            return INT_MAX;
+        a = r->len[r->lut->esc_sym];
+        b = r->len[run];
+        c = r->len[u & 63];
+        d = r->len[u >> 6];
+        return a && b && c && d ? a + b + c + d : INT_MAX;
+    }
+}
+
+/*
+ * Trellis over one block in scan order: each coefficient keeps its nearest
+ * level, moves one step towards zero or becomes zero, minimising
+ * D + lambda * R with D in the pixel domain (basis energies) and R the exact
+ * code lengths (run/level symbols, escapes, EOB; an all-zero block costs no
+ * bits as its cbp bit is cleared). fixed0: the first coefficient (predicted
+ * intra DC) is kept as it is.
+ */
+static void trellis_block(const RDOCtx *r, int nc, const int *coef, const int *qs,
+                          const double *w, int fixed0, double lambda, int16_t *lev)
+{
+    double best[65], zsum[65];             /* best[j + 1]: last nonzero at j */
+    int    from[65], lvl[65];
+    int    eob = r->len[r->lut->eob_sym];
+
+    if (!eob)
+        return;
+    zsum[0] = 0;
+    for (int i = 0; i < nc; i++) {         /* distortion of zeroing 0..i-1 */
+        double e = coef[i];
+        zsum[i + 1] = zsum[i] + w[i] * e * e;
+    }
+    best[0] = 0;
+    for (int j = 0; j < nc; j++) {
+        int l0 = lev[j], cand[3], nc_ = 0;
+        best[j + 1] = INFINITY;
+        if (!l0)
+            continue;
+        cand[nc_++] = l0;
+        if (!(fixed0 && !j)) {
+            if (FFABS(l0) > 1)
+                cand[nc_++] = l0 - FFSIGN(l0);
+        }
+        for (int c = 0; c < nc_; c++) {
+            int l = cand[c];
+            double e = coef[j] - dequantize(l, qs[j]);
+            double d = w[j] * e * e;
+            /* previous nonzero at p (p = -1: none) */
+            for (int p = j - 1; p >= -1; p--) {
+                double cost;
+                int bits;
+                if (best[p + 1] == INFINITY)
+                    continue;
+                if (fixed0 && lev[0] && p < 0 && j > 0)
+                    continue;            /* the fixed DC cannot be skipped */
+                bits = rdo_bits(r, j - p - 1, l);
+                if (bits == INT_MAX)
+                    continue;
+                cost = best[p + 1] + (zsum[j] - zsum[p + 1]) + d + lambda * bits;
+                if (cost < best[j + 1]) {
+                    best[j + 1] = cost;
+                    from[j + 1] = p;
+                    lvl[j + 1]  = l;
+                }
+            }
+        }
+    }
+    {
+        /* choose the last nonzero (or none) */
+        int last = -1;
+        double bc = fixed0 && lev[0] ? INFINITY : zsum[nc];
+        for (int j = 0; j < nc; j++) {
+            double c;
+            if (best[j + 1] == INFINITY)
+                continue;
+            c = best[j + 1] + (zsum[nc] - zsum[j + 1]) + lambda * eob;
+            if (c < bc) {
+                bc = c;
+                last = j;
+            }
+        }
+        if (bc == INFINITY)
+            return;                      /* nothing codable: keep the levels */
+        {
+            int16_t out[64] = { 0 };
+            for (int j = last; j >= 0; j = from[j + 1])
+                out[j] = lvl[j + 1];
+            memcpy(lev, out, nc * sizeof(*lev));
+        }
+    }
+}
+
+/**
+ * Transform and quantize a whole band according to the MB types. Intra
+ * blocks code the source with the intra tables and DC prediction between
+ * intra blocks in decoding order; inter blocks code source - prediction with
+ * the inter tables. Inter MBs without residual are flagged empty when the
+ * decoder would reconstruct them identically from the empty flag.
+ */
+/* Quantize one MB, carrying the intra DC predictor in coding order. When
+ * requested, also measure decoder-domain distortion and VLC rate for RDO.
+ * A forced skip clears residuals without changing the intra DC predictor. */
+static double quant_mb(EncBand *b, int m, int glob_quant, const RDOCtx *rdo,
+                       int *prev_dc, int skip, int measure)
+{
+    const int bs = b->blk_size, nc = bs * bs;
+    const int mbs_x = b->aw / b->mb_size;
+    const int blks = b->mb_size != bs ? 4 : 1;
+    const int intra = b->mb_type[m] == MB_INTRA;
+    const uint16_t *base = intra ? b->base : b->inter_base;
+    int qi = av_clip(glob_quant + b->mb_qd[m], 0, 23);
+    int quant = intra ? b->scale[qi] : b->inter_scale[qi];
+    int cbp = 0;
+    double cost = 0;
+    int cache = intra ? 0 : !!(b->mb_mv[m][0] || b->mb_mv[m][1]) + 1;
+
+    if (cache == 2 && (b->coef_mv[m][0] != b->mb_mv[m][0] ||
+                       b->coef_mv[m][1] != b->mb_mv[m][1])) {
+        for (int blk = 0; blk < blks; blk++)
+            b->coef_valid[m * blks + blk] &= ~(1 << cache);
+        memcpy(b->coef_mv[m], b->mb_mv[m], sizeof(*b->coef_mv));
+    }
+
+    for (int blk = 0; blk < blks; blk++) {
+        int x0 = (m % mbs_x) * b->mb_size + (blk & 1) * bs;
+        int y0 = (m / mbs_x) * b->mb_size + (blk >> 1) * bs;
+        int16_t *lev = b->levels + (m * blks + blk) * nc;
+        double pix[64], wsc[64], lambda = 0;
+        int coefs[64], qs[64], nz = 0, dc = *prev_dc;
+        int block = m * blks + blk;
+        int *cached = b->coef_cache[cache] + block * nc;
+        if (!skip && !(b->coef_valid[block] & (1 << cache))) {
+            for (int y = 0; y < bs; y++)
+                for (int x = 0; x < bs; x++) {
+                    pix[y * bs + x] = b->buf[(y0 + y) * b->aw + x0 + x];
+                    if (!intra)
+                        pix[y * bs + x] -= b->pred[(y0 + y) * b->pitch + x0 + x];
+                }
+            for (int i = 0; i < nc; i++) {
+                int pos = b->scan[i];
+                const double *f = b->fwd + pos * nc;
+                double acc = 0;
+                for (int k = 0; k < b->fwd_count[pos]; k++) {
+                    int index = b->fwd_index[pos][k];
+                    acc += f[index] * pix[index];
+                }
+                cached[i] = lrint(acc);
+            }
+            b->coef_valid[block] |= 1 << cache;
+        }
+        for (int i = 0; i < nc; i++) {
+            int pos = b->scan[i];
+            coefs[i] = skip ? 0 : cached[i];
+            if (!pos && b->is_2d && intra)
+                coefs[i] -= dc;  /* error relative to the incoming predictor */
+            qs[i] = (base[pos] * quant) >> 9;
+            lev[i] = skip ? 0 : quantize(coefs[i], qs[i]);
+            wsc[i] = b->w[pos];
+            lambda += wsc[i] * FFMAX(qs[i], 1) * FFMAX(qs[i], 1);
+            nz |= lev[i];
+        }
+        if (rdo) {
+            lambda *= rdo->k / nc;
+            if (nz) {
+                trellis_block(rdo, nc, coefs, qs, wsc, b->is_2d && intra, lambda, lev);
+                nz = 0;
+                for (int i = 0; i < nc; i++)
+                    nz |= lev[i];
+            }
+        }
+        if (b->is_2d && intra)
+            *prev_dc += dequantize(lev[0], qs[0]);
+        cbp |= !!nz << blk;
+
+        if (measure) {
+            int32_t trvec[64] = { 0 };
+            int16_t rec[64];
+            uint8_t flags[8] = { 0 };
+            double distortion = 0, mode_lambda = 0;
+            int bits = 0, run = 0;
+            for (int i = 0; i < nc; i++) {
+                int pos = b->scan[i];
+                trvec[pos] = dequantize(lev[i], qs[i]);
+                if (lev[i]) {
+                    int n = rdo_bits(rdo, run, lev[i]);
+                    if (n == INT_MAX)
+                        return INFINITY;
+                    bits += n;
+                    run = 0;
+                } else {
+                    run++;
+                }
+            }
+            if (b->is_2d && intra)
+                trvec[0] = *prev_dc;
+            for (int i = 0; i < nc; i++)
+                flags[i & (bs - 1)] |= !!trvec[i];
+            if (nz)
+                b->inv_transform(trvec, rec, bs, flags);
+            else if (intra) {
+                int32_t dc32 = *prev_dc;
+                b->dc_transform(&dc32, rec, bs, bs);
+            } else {
+                memset(rec, 0, nc * sizeof(*rec));
+            }
+            for (int y = 0; y < bs && y0 + y < b->height; y++)
+                for (int x = 0; x < bs && x0 + x < b->width; x++) {
+                    int val = rec[y * bs + x];
+                    double err;
+                    if (!intra)
+                        val += b->pred[(y0 + y) * b->pitch + x0 + x];
+                    err = b->buf[(y0 + y) * b->aw + x0 + x] - val;
+                    distortion += err * err;
+                }
+            if (nz) {
+                if (!rdo->len[rdo->lut->eob_sym])
+                    return INFINITY;
+                bits += rdo->len[rdo->lut->eob_sym];
+            }
+            /* Compare modes with a common multiplier: using the candidate's
+             * intra/inter matrix here would reward coarse quantization. */
+            for (int i = 0; i < nc; i++) {
+                int pos = b->scan[i];
+                int q = FFMAX((b->inter_base[pos] * b->inter_scale[qi]) >> 9, 1);
+                mode_lambda += b->w[pos] * q * q;
+            }
+            mode_lambda *= rdo->k / nc;
+            cost += distortion / FFMAX(mode_lambda, 0.000001) + bits;
+        }
+    }
+    b->cbp[m] = cbp;
+    b->mb_empty[m] = !intra && !cbp &&
+                     (b->inherit || (!b->mb_mv[m][0] && !b->mb_mv[m][1]));
+    return cost;
+}
+
+static void quant_band(EncBand *b, int glob_quant, const RDOCtx *rdo)
+{
+    for (int t = 0; t < b->ntiles; t++) {
+        int prev_dc = 0;
+        for (int k = b->tile_start[t]; k < b->tile_start[t + 1]; k++)
+            quant_mb(b, b->order[k], glob_quant, rdo, &prev_dc, 0, 0);
+    }
+}
+
+/**
+ * Reconstruct the band exactly as ivi_decode_blocks() does and compute
+ * the band checksum (sum of all samples inside the band, mod 2^16).
+ */
+static void recon_band(EncBand *b, int glob_quant)
+{
+    const int bs = b->blk_size, nc = bs * bs;
+    const int mbs_x = b->aw / b->mb_size, mbs_y = b->ah / b->mb_size;
+    const int blks  = b->mb_size != bs ? 4 : 1;
+    int32_t prev_dc = 0;
+    unsigned sum = 0;
+    (void)mbs_y;
+
+    for (int t = 0; t < b->ntiles; t++) {
+        prev_dc = 0;
+        for (int k = b->tile_start[t]; k < b->tile_start[t + 1]; k++) {
+            int m = b->order[k], mx = m % mbs_x, my = m / mbs_x;
+            const int16_t *lev = b->levels + m * blks * nc;
+            int cbp = b->cbp[m];
+            int intra = b->mb_type[m] == MB_INTRA;
+            const uint16_t *base = intra ? b->base : b->inter_base;
+            /* the decoder only receives the delta of MBs with coefficients */
+            int qi = av_clip(glob_quant + (cbp ? b->mb_qd[m] : 0), 0, 23);
+            int quant = intra ? b->scale[qi] : b->inter_scale[qi];
+            for (int blk = 0; blk < blks; blk++, lev += nc) {
+                int x0 = mx * b->mb_size + (blk & 1) * bs;
+                int y0 = my * b->mb_size + (blk >> 1) * bs;
+                int16_t *dst = b->recon + y0 * b->pitch + x0;
+                int mc_type = 0;
+                const int16_t *src = intra ? NULL :
+                                     mc_source(b, x0, y0, b->mb_mv[m], &mc_type);
+
+                if (cbp & (1 << blk)) {
+                    int32_t trvec[64] = { 0 };
+                    uint8_t col_flags[8] = { 0 };
+                    for (int i = 0; i < nc; i++) {
+                        int pos = b->scan[i];
+                        int q   = (base[pos] * quant) >> 9;
+                        int val = dequantize(lev[i], q);
+                        trvec[pos] = val;
+                        col_flags[pos & (bs - 1)] |= !!val;
+                    }
+                    if (b->is_2d && intra) {
+                        prev_dc     += trvec[0];
+                        trvec[0]     = prev_dc;
+                        col_flags[0] |= !!prev_dc;
+                    }
+                    b->inv_transform(trvec, dst, b->pitch, col_flags);
+                    if (!intra)
+                        b->mc_delta(dst, src, b->pitch, mc_type);
+                } else if (intra) {
+                    b->dc_transform(&prev_dc, dst, b->pitch, bs);
+                } else {
+                    b->mc_no_delta(dst, src, b->pitch, mc_type);
+                }
+            }
+        }
+    }
+
+    for (int y = 0; y < b->height; y++)
+        for (int x = 0; x < b->width; x++)
+            sum += b->recon[y * b->pitch + x];
+    b->checksum = sum & 0xFFFF;
+}
+
+/* ------------------------------------------------------------------ */
+/* motion estimation (luma band of the basic profile)                  */
+
+/* Vector of an inheriting band (both in half-pel units) from the luma one:
+ * the decoder scales the vector as coded, i.e. in full pels when the bands
+ * use full-pel vectors (Quick Compress) */
+static int inherit_mv(int v, int scale, int halfpel)
+{
+    if (halfpel)
+        return scale ? ivi_scale_mv(v, scale) : v;
+    v >>= 1;
+    return 2 * (scale ? ivi_scale_mv(v, scale) : v);
+}
+
+/* Limit prediction to padding covered by coded MBs. The decoder allocation
+ * can be wider than that in Quick Compress (8x8 / 4x4 MBs); its unused padding
+ * is not a portable reference between Intel and FFmpeg.
+ * Is the half-pel vector valid for the luma MB and for the chroma MBs
+ * inheriting it (the decoder rejects vectors leaving the band buffer)? */
+static int mv_valid(const Indeo5EncContext *s, int mx, int my, int mvx, int mvy)
+{
+    const EncBand *l = &s->bands[0], *c = &s->bands[s->luma_bands];
+    int fx = mvx >> 1, fy = mvy >> 1;
+    int x0 = mx * l->mb_size, y0 = my * l->mb_size;
+    int scale = (l->mb_size >> 3) - (c->mb_size >> 3);
+    int cmx, cmy, cx0 = mx * c->mb_size, cy0 = my * c->mb_size;
+
+    if (x0 + fx < 0 || x0 + fx + l->mb_size + (mvx & 1) > l->aw ||
+        y0 + fy < 0 || y0 + fy + l->mb_size + (mvy & 1) > l->ah)
+        return 0;
+    cmx = inherit_mv(mvx, scale, l->halfpel);
+    cmy = inherit_mv(mvy, scale, l->halfpel);
+    if (cx0 + (cmx >> 1) < 0 || cx0 + (cmx >> 1) + c->mb_size + (cmx & 1) > c->aw ||
+        cy0 + (cmy >> 1) < 0 || cy0 + (cmy >> 1) + c->mb_size + (cmy & 1) > c->ah)
+        return 0;
+    return 1;
+}
+
+/* SAD of a 16x16 MB against the reference at a half-pel vector, using the
+ * decoder's interpolation (ivi_mc_*). */
+static int mb_sad(const EncBand *b, int x0, int y0, int mvx, int mvy, int limit)
+{
+    const int pitch = b->pitch;
+    const int16_t *r = b->mcref + (y0 + (mvy >> 1)) * pitch + x0 + (mvx >> 1);
+    const float *src = b->buf + y0 * b->aw + x0;
+    int type = ((mvy & 1) << 1) | (mvx & 1), sad = 0;
+
+    for (int y = 0; y < b->mb_size; y++, r += pitch, src += b->aw) {
+        for (int x = 0; x < b->mb_size; x++) {
+            int p;
+            switch (type) {
+            case 0:  p = r[x];                                            break;
+            case 1:  p = (r[x] + r[x + 1]) >> 1;                          break;
+            case 2:  p = (r[x] + r[x + pitch]) >> 1;                      break;
+            default: p = (r[x] + r[x + 1] + r[x + pitch] + r[x + pitch + 1]) >> 2;
+            }
+            sad += abs((int)src[x] - p);
+        }
+        if (sad >= limit)
+            break;
+    }
+    return sad;
+}
+
+/* deviation of the MB from its block means: cost estimate for intra coding */
+static int mb_intra_cost(const EncBand *b, int x0, int y0)
+{
+    const int bs = b->blk_size, blks = b->mb_size == bs ? 1 : 4;
+    int cost = 0;
+    for (int blk = 0; blk < blks; blk++) {
+        const float *src = b->buf + (y0 + (blk >> 1) * bs) * b->aw + x0 + (blk & 1) * bs;
+        float mean = 0;
+        for (int y = 0; y < bs; y++)
+            for (int x = 0; x < bs; x++)
+                mean += src[y * b->aw + x];
+        mean /= bs * bs;
+        for (int y = 0; y < bs; y++)
+            for (int x = 0; x < bs; x++)
+                cost += fabsf(src[y * b->aw + x] - mean);
+    }
+    return cost;
+}
+
+static void luma_decisions(Indeo5EncContext *s)
+{
+    EncBand *b = &s->bands[0];
+    const int mbs_x = b->aw / b->mb_size, mbs_y = b->ah / b->mb_size;
+    const int range = s->me_range;
+    const int lambda = 2 + s->quant / 4;
+    int pred[2] = { 0, 0 };
+    (void)mbs_y;
+
+    for (int t = 0; t < b->ntiles; t++) {
+        pred[0] = pred[1] = 0;       /* MV prediction restarts in each tile */
+        for (int k = b->tile_start[t]; k < b->tile_start[t + 1]; k++) {
+            int m = b->order[k], mx = m % mbs_x, my = m / mbs_x;
+            int x0 = mx * b->mb_size, y0 = my * b->mb_size;
+            int best[2] = { 0, 0 }, best_cost, sad0, cost;
+            int cand[5][2] = { { 0, 0 }, { pred[0], pred[1] },
+                               { 0, 0 }, { 0, 0 }, { 0, 0 } };
+            int ncand = 2;
+
+#define MV_COST(vx, vy) (lambda * (abs((vx) - pred[0]) + abs((vy) - pred[1])))
+            if (mx) {
+                cand[ncand][0] = b->mb_mv[m - 1][0];
+                cand[ncand++][1] = b->mb_mv[m - 1][1];
+            }
+            if (my) {
+                cand[ncand][0] = b->mb_mv[m - mbs_x][0];
+                cand[ncand++][1] = b->mb_mv[m - mbs_x][1];
+            }
+
+            sad0 = mb_sad(b, x0, y0, 0, 0, INT_MAX);
+            best_cost = sad0 + MV_COST(0, 0);
+            /* full-pel candidates, then a coarse grid */
+            for (int c = 1; c < ncand; c++) {
+                int vx = cand[c][0] & ~1, vy = cand[c][1] & ~1;
+                if (FFABS(vx) > range || FFABS(vy) > range || !mv_valid(s, mx, my, vx, vy))
+                    continue;
+                cost = mb_sad(b, x0, y0, vx, vy, best_cost) + MV_COST(vx, vy);
+                if (cost < best_cost) {
+                    best_cost = cost; best[0] = vx; best[1] = vy;
+                }
+            }
+            for (int vy = -range & ~7; vy <= range && !s->quick; vy += 8)
+                for (int vx = -range & ~7; vx <= range; vx += 8) {
+                    if (!mv_valid(s, mx, my, vx, vy))
+                        continue;
+                    cost = mb_sad(b, x0, y0, vx, vy, best_cost) + MV_COST(vx, vy);
+                    if (cost < best_cost) {
+                        best_cost = cost; best[0] = vx; best[1] = vy;
+                    }
+                }
+            /* full-pel diamond refinement, then half-pel (not in quick mode) */
+            for (int step = 2; step >= 1 + s->quick; step--) {
+                for (int iter = 0; iter < 32; iter++) {
+                    static const int dir[8][2] = { { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 },
+                                                   { -1, -1 }, { 1, -1 }, { -1, 1 }, { 1, 1 } };
+                    int improved = 0, cx = best[0], cy = best[1];
+                    for (int d = 0; d < 8; d++) {
+                        int vx = cx + dir[d][0] * step, vy = cy + dir[d][1] * step;
+                        if (FFABS(vx) > range || FFABS(vy) > range ||
+                            !mv_valid(s, mx, my, vx, vy))
+                            continue;
+                        cost = mb_sad(b, x0, y0, vx, vy, best_cost) + MV_COST(vx, vy);
+                        if (cost < best_cost) {
+                            best_cost = cost; best[0] = vx; best[1] = vy; improved = 1;
+                        }
+                    }
+                    if (!improved || step == 1)
+                        break;
+                }
+            }
+#undef MV_COST
+            /* prefer the zero vector (an empty MB) when it is nearly as good */
+            if (sad0 <= best_cost - (lambda * (abs(pred[0]) + abs(pred[1]))) + 2 * lambda) {
+                best[0] = best[1] = 0;
+                best_cost = sad0;
+            }
+            b->me_mv[m][0] = best[0];
+            b->me_mv[m][1] = best[1];
+            if (best_cost > mb_intra_cost(b, x0, y0) + 256) {
+                b->mb_type[m] = MB_INTRA;
+                b->mb_mv[m][0] = b->mb_mv[m][1] = 0;
+            } else {
+                b->mb_type[m] = MB_INTER;
+                b->mb_mv[m][0] = best[0];
+                b->mb_mv[m][1] = best[1];
+                if (best[0] || best[1]) {
+                    pred[0] = best[0];
+                    pred[1] = best[1];
+                }
+            }
+            b->me_type[m] = b->mb_type[m];
+        }
+    }
+}
+
+/* MB types and vectors of a band inheriting from luma band 0 (band flag 0x02) */
+static void inherit_decisions(Indeo5EncContext *s, EncBand *b)
+{
+    const EncBand *l = &s->bands[0];
+    const int n = (b->aw / b->mb_size) * (b->ah / b->mb_size);
+    const int scale = (l->mb_size >> 3) - (b->mb_size >> 3);
+
+    for (int m = 0; m < n; m++) {
+        b->mb_type[m] = l->mb_type[m];
+        b->mb_mv[m][0] = inherit_mv(l->mb_mv[m][0], scale, l->halfpel);
+        b->mb_mv[m][1] = inherit_mv(l->mb_mv[m][1], scale, l->halfpel);
+    }
+}
+
+/* Iterate over the VLC symbols of one block. EMIT gets symbols that go
+ * through the rvmap (run/level pairs, EOB, escape), EMIT_RAW the escape
+ * payload, which is coded as plain codebook indices. */
+#define FOR_EACH_SYMBOL(lut, lev, nc, EMIT, EMIT_RAW) do {                  \
+    int run_ = 0;                                                           \
+    for (int i_ = 0; i_ < (nc); i_++) {                                     \
+        int l_ = (lev)[i_];                                                 \
+        int s_;                                                             \
+        if (!l_) { run_++; continue; }                                      \
+        s_ = FFABS(l_) <= LUT_LEVEL && run_ < 64 ?                          \
+             (lut)->sym[run_ + 1][l_ + LUT_LEVEL] : -1;                     \
+        if (s_ >= 0) {                                                      \
+            EMIT(s_);                                                       \
+        } else {                                                            \
+            int u_ = l_ > 0 ? 2 * l_ - 1 : -2 * l_;                         \
+            EMIT((lut)->esc_sym);                                           \
+            EMIT_RAW(run_);                                                 \
+            EMIT_RAW(u_ & 63);                                              \
+            EMIT_RAW(u_ >> 6);                                              \
+        }                                                                   \
+        run_ = 0;                                                           \
+    }                                                                       \
+    EMIT((lut)->eob_sym);                                                   \
+} while (0)
+
+/* Call cb() for the coded blocks of the MBs order[k0..k1) in coding order. */
+static void for_each_coded_block_range(const EncBand *b, int k0, int k1,
+                                       void (*cb)(void *opaque, const int16_t *lev),
+                                       void *opaque)
+{
+    const int nc   = b->blk_size * b->blk_size;
+    const int blks = b->mb_size != b->blk_size ? 4 : 1;
+
+    for (int k = k0; k < k1; k++) {
+        int m = b->order[k];
+        const int16_t *lev = b->levels + m * blks * nc;
+        for (int blk = 0; blk < blks; blk++, lev += nc)
+            if (b->cbp[m] & (1 << blk))
+                cb(opaque, lev);
+    }
+}
+
+static void for_each_coded_block(const EncBand *b,
+                                 void (*cb)(void *opaque, const int16_t *lev),
+                                 void *opaque)
+{
+    for_each_coded_block_range(b, 0, b->tile_start[b->ntiles], cb, opaque);
+}
+
+typedef struct HistCtx {
+    const RVLut *lut;
+    int nc;
+    uint32_t *hist_map;   ///< symbols mapped through the rvmap
+    uint32_t *hist_raw;   ///< escape payload symbols
+} HistCtx;
+
+static void hist_block(void *opaque, const int16_t *lev)
+{
+    HistCtx *h = opaque;
+#define HIST_EMIT(sym)     h->hist_map[sym]++
+#define HIST_EMIT_RAW(sym) h->hist_raw[sym]++
+    FOR_EACH_SYMBOL(h->lut, lev, h->nc, HIST_EMIT, HIST_EMIT_RAW);
+}
+
+typedef struct WriteCtx {
+    const RVLut *lut;
+    const HuffCodes *hc;
+    int nc;
+    PutBitContext *pb;
+} WriteCtx;
+
+static void write_block(void *opaque, const int16_t *lev)
+{
+    WriteCtx *w = opaque;
+#define PUT_EMIT(sym) put_bits(w->pb, w->hc->bits[sym], w->hc->code[sym])
+    FOR_EACH_SYMBOL(w->lut, lev, w->nc, PUT_EMIT, PUT_EMIT);
+}
+
+
+static uint64_t table_cost(const uint8_t *len, const uint32_t *map,
+                           const uint32_t *raw)
+{
+    uint64_t bits = 0;
+    for (int i = 0; i < 256; i++) {
+        uint32_t n = map[i] + raw[i];
+        if (!n)
+            continue;
+        if (!len[i])
+            return UINT64_MAX;    /* symbol not representable */
+        bits += (uint64_t)n * len[i];
+    }
+    return bits;
+}
+
+/**
+ * Find the custom codebook descriptor (IVI "huffman descriptor": rows of
+ * 2^xbits codes, row i using codes of length i + xbits + 1, the last row
+ * without the terminating bit) minimising the coded size of the given
+ * symbol counts, including the descriptor itself. Dynamic programming over
+ * (rows used, symbols covered).
+ * @return cost in bits, or UINT64_MAX if no valid descriptor exists
+ */
+static uint64_t best_custom_desc(const uint32_t *cnt, IVIHuffDesc *desc)
+{
+    uint64_t prefix[257], cost[MAX_HUFF_ROWS + 1][257], best = UINT64_MAX;
+    uint8_t  from_xb[MAX_HUFF_ROWS + 1][257];
+    uint16_t from_pos[MAX_HUFF_ROWS + 1][257];
+    int need = 0, best_rows = 0, best_last = 0, best_pos = 0;
+
+    prefix[0] = 0;
+    for (int i = 0; i < 256; i++) {
+        prefix[i + 1] = prefix[i] + cnt[i];
+        if (cnt[i])
+            need = i + 1;
+    }
+    if (!need)
+        need = 1;
+
+    for (int r = 0; r <= MAX_HUFF_ROWS; r++)
+        for (int p = 0; p <= 256; p++)
+            cost[r][p] = UINT64_MAX;
+    cost[0][0] = 0;
+
+    for (int r = 0; r < MAX_HUFF_ROWS; r++) {
+        for (int p = 0; p < 256; p++) {
+            if (cost[r][p] == UINT64_MAX)
+                continue;
+            for (int xb = 0; xb <= 8; xb++) {
+                int n = FFMIN(256, p + (1 << xb));
+                /* row r as a middle row */
+                int len = r + xb + 1;
+                if (len <= IVI_VLC_BITS && n < 256 + 1 && r + 1 < MAX_HUFF_ROWS) {
+                    uint64_t c = cost[r][p] + len * (prefix[n] - prefix[p]);
+                    if (c < cost[r + 1][n]) {
+                        cost[r + 1][n] = c;
+                        from_xb[r + 1][n]  = xb;
+                        from_pos[r + 1][n] = p;
+                    }
+                }
+                /* row r as the last row */
+                len = r + xb;
+                if (len >= 1 && len <= IVI_VLC_BITS && n >= need) {
+                    uint64_t c = cost[r][p] + len * (prefix[n] - prefix[p]) +
+                                 4 + 4 * (r + 1);
+                    if (c < best) {
+                        best      = c;
+                        best_rows = r + 1;
+                        best_last = xb;
+                        best_pos  = p;
+                    }
+                }
+            }
+        }
+    }
+    if (best == UINT64_MAX)
+        return best;
+
+    desc->num_rows = best_rows;
+    desc->xbits[best_rows - 1] = best_last;
+    for (int r = best_rows - 1, p = best_pos; r > 0; r--) {
+        desc->xbits[r - 1] = from_xb[r][p];
+        p = from_pos[r][p];
+    }
+    return best;
+}
+
+static void huff_lengths(const HuffCodes *hc, uint8_t *len)
+{
+    memcpy(len, hc->bits, 256);
+}
+
+/**
+ * Greedy rvmap corrections: swap rvmap entries (symbols p, q) so that
+ * frequent run/level pairs land on short codewords, as long as a swap saves
+ * more than the 16 bits it costs. The EOB and escape symbols are never
+ * moved: FFmpeg's decoder follows them, but Intel's IR50_32.DLL rejects the
+ * band (verified with tools/iv5ref).
+ */
+static void find_corrections(uint32_t *map, const uint32_t *raw,
+                             const uint8_t *len, int eob, int esc,
+                             BandTables *t)
+{
+    while (t->num_corr < MAX_CORR) {
+        int64_t best_gain = 16 + (t->num_corr ? 0 : 8);
+        int bp = -1, bq = -1;
+        for (int p = 0; p < 256; p++) {
+            if (!map[p] || !len[p] || p == eob || p == esc)
+                continue;
+            for (int q = 0; q < 256; q++) {
+                int64_t gain;
+                if (q == p || !len[q] || len[q] >= len[p] || q == eob || q == esc)
+                    continue;
+                /* moving map[p] to the shorter q and map[q] to p */
+                gain = ((int64_t)map[p] - map[q]) * (len[p] - len[q]);
+                if (gain > best_gain) {
+                    best_gain = gain;
+                    bp = p;
+                    bq = q;
+                }
+            }
+        }
+        if (bp < 0)
+            break;
+        FFSWAP(uint32_t, map[bp], map[bq]);
+        t->corr[2 * t->num_corr]     = bp;
+        t->corr[2 * t->num_corr + 1] = bq;
+        t->num_corr++;
+    }
+    (void)raw;
+}
+
+/* Apply correction pairs to a copy of the rvmap exactly like the decoder. */
+static void apply_corrections(const RVMapDesc *src, const BandTables *t,
+                              RVLut *lut)
+{
+    RVMapDesc rv = *src;
+    for (int i = 0; i < t->num_corr; i++) {
+        int a = t->corr[2 * i], b = t->corr[2 * i + 1];
+        FFSWAP(uint8_t, rv.runtab[a], rv.runtab[b]);
+        FFSWAP(int16_t, rv.valtab[a], rv.valtab[b]);
+        if (a == rv.eob_sym || b == rv.eob_sym)
+            rv.eob_sym ^= a ^ b;
+        if (a == rv.esc_sym || b == rv.esc_sym)
+            rv.esc_sym ^= a ^ b;
+    }
+    build_rvlut(&rv, lut);
+}
+
+/**
+ * Choose rvmap, codebook (static or custom) and rvmap corrections for a
+ * band so that it costs the fewest bits.
+ */
+static void choose_tables(Indeo5EncContext *s, const EncBand *b, BandTables *t)
+{
+    uint32_t map[IVI5_NUM_RVMAPS][256], raw[IVI5_NUM_RVMAPS][256];
+    uint8_t len[256];
+
+    t->bits = UINT64_MAX;
+    t->num_corr = 0;
+    if (s->quick) {                  /* IR50_QC: block codebook 3, default rvmap */
+        HistCtx h = { &s->rvlut[IVI5_NUM_RVMAPS - 1], b->blk_size * b->blk_size,
+                      map[0], raw[0] };
+        memset(map[0], 0, sizeof(map[0]));
+        memset(raw[0], 0, sizeof(raw[0]));
+        for_each_coded_block(b, hist_block, &h);
+        huff_lengths(&s->huff[3], len);
+        if (table_cost(len, map[0], raw[0]) != UINT64_MAX) {
+            t->rv_sel   = IVI5_NUM_RVMAPS - 1;
+            t->huff_sel = 3;
+            t->hc  = s->huff[3];
+            t->lut = s->rvlut[t->rv_sel];
+            return;
+        }
+    }
+    for (int r = 0; r < IVI5_NUM_RVMAPS; r++) {
+        HistCtx h = { &s->rvlut[r], b->blk_size * b->blk_size, map[r], raw[r] };
+        memset(map[r], 0, sizeof(map[r]));
+        memset(raw[r], 0, sizeof(raw[r]));
+        for_each_coded_block(b, hist_block, &h);
+
+        for (int c = 0; c <= (s->tables ? HUFF_CUSTOM : IVI5_NUM_HUFF - 1); c++) {
+            IVIHuffDesc d;
+            uint64_t bits;
+            if (c < IVI5_NUM_HUFF) {
+                huff_lengths(&s->huff[c], len);
+                bits = table_cost(len, map[r], raw[r]);
+                /* side info: selector (3 bits) unless the default is used */
+                if (bits != UINT64_MAX)
+                    bits += c == IVI5_NUM_HUFF - 1 ? 0 : 3;
+            } else {
+                uint32_t cnt[256];
+                for (int i = 0; i < 256; i++)
+                    cnt[i] = map[r][i] + raw[r][i];
+                bits = best_custom_desc(cnt, &d);
+                if (bits != UINT64_MAX)
+                    bits += 3;
+            }
+            if (bits != UINT64_MAX && r < IVI5_NUM_RVMAPS - 1)
+                bits += 3;                   /* rvmap selector */
+            if (bits < t->bits) {
+                t->bits     = bits;
+                t->rv_sel   = r;
+                t->huff_sel = c;
+                if (c == HUFF_CUSTOM)
+                    t->desc = d;
+            }
+        }
+    }
+
+    if (t->huff_sel < IVI5_NUM_HUFF)
+        t->hc = s->huff[t->huff_sel];
+    else
+        build_huff(&t->desc, &t->hc);
+    t->lut = s->rvlut[t->rv_sel];
+
+    if (s->tables >= 2) {
+        BandTables c = *t;
+        uint32_t m[256], cnt[256];
+        uint64_t bits;
+
+        memcpy(m, map[c.rv_sel], sizeof(m));
+        for (int pass = 0; pass < 2; pass++) {
+            huff_lengths(&c.hc, len);
+            find_corrections(m, raw[c.rv_sel], len,
+                             ff_ivi_rvmap_tabs[c.rv_sel].eob_sym,
+                             ff_ivi_rvmap_tabs[c.rv_sel].esc_sym, &c);
+            if (!s->tables || pass)
+                break;
+            /* re-optimise the custom codebook for the reordered symbols */
+            for (int i = 0; i < 256; i++)
+                cnt[i] = m[i] + raw[c.rv_sel][i];
+            if (best_custom_desc(cnt, &c.desc) != UINT64_MAX) {
+                c.huff_sel = HUFF_CUSTOM;
+                build_huff(&c.desc, &c.hc);
+            }
+        }
+        huff_lengths(&c.hc, len);
+        bits = table_cost(len, m, raw[c.rv_sel]);
+        if (bits != UINT64_MAX) {
+            bits += c.num_corr ? 8 + 16 * c.num_corr : 0;
+            if (c.huff_sel == HUFF_CUSTOM)
+                bits += 4 + 4 * c.desc.num_rows;
+            if (c.huff_sel != IVI5_NUM_HUFF - 1)
+                bits += 3;
+            if (c.rv_sel != IVI5_NUM_RVMAPS - 1)
+                bits += 3;
+            if (bits < t->bits) {
+                *t = c;
+                t->bits = bits;
+                apply_corrections(&ff_ivi_rvmap_tabs[t->rv_sel], t, &t->lut);
+            }
+        }
+    }
+}
+
+static unsigned mv_sym(int d)
+{
+    return d > 0 ? 2 * d - 1 : -2 * d;   /* inverse of IVI_TOSIGNED */
+}
+
+/* Call cb() for the MB codebook symbols (quantizer deltas, MV deltas) of
+ * luma band 0 in coding order. */
+static void for_each_mv_sym(const EncBand *b, void (*cb)(void *, unsigned), void *opaque)
+{
+    int px = 0, py = 0;
+    for (int k = 0, t = 0; k < b->tile_start[b->ntiles]; k++) {
+        int m = b->order[k];
+        if (k == b->tile_start[t]) {
+            px = py = 0;
+            t++;
+        }
+        if (b->qdelta)               /* every MB with frame flag 0x08 */
+            cb(opaque, mv_sym(b->mb_qd[m]));
+        if (b->mb_empty[m])
+            continue;
+        if (b->mb_type[m] != MB_INTER)
+            continue;
+        {
+            int vx = b->mb_mv[m][0] >> !b->halfpel, vy = b->mb_mv[m][1] >> !b->halfpel;
+            cb(opaque, mv_sym(vy - py));
+            cb(opaque, mv_sym(vx - px));
+            px = vx;
+            py = vy;
+        }
+    }
+}
+
+static void count_sym(void *opaque, unsigned sym)
+{
+    ((uint32_t *)opaque)[FFMIN(sym, 255)]++;
+}
+
+/* Pick the macroblock codebook (static, default or custom) for the frame. */
+static void choose_mb_table(Indeo5EncContext *s)
+{
+    uint32_t hist[256] = { 0 }, zero[256] = { 0 };
+    uint64_t best = UINT64_MAX;
+    uint8_t len[256];
+
+    for_each_mv_sym(&s->bands[0], count_sym, hist);
+    if (s->quick) {                  /* IR50_QC: MB codebook 3 */
+        huff_lengths(&s->mb_huff[3], len);
+        if (table_cost(len, hist, zero) != UINT64_MAX) {
+            s->mb_huff_sel = 3;
+            s->mb_hc = s->mb_huff[3];
+            return;
+        }
+    }
+    s->mb_huff_sel = IVI5_NUM_HUFF - 1;
+    for (int c = 0; c <= HUFF_CUSTOM; c++) {
+        IVIHuffDesc d;
+        uint64_t bits;
+        if (c < IVI5_NUM_HUFF) {
+            huff_lengths(&s->mb_huff[c], len);
+            bits = table_cost(len, hist, zero);
+            if (bits != UINT64_MAX && c != IVI5_NUM_HUFF - 1)
+                bits += 3;
+        } else {
+            bits = best_custom_desc(hist, &d);
+            if (bits != UINT64_MAX)
+                bits += 3;
+        }
+        if (bits < best) {
+            best = bits;
+            s->mb_huff_sel = c;
+            if (c == HUFF_CUSTOM)
+                s->mb_desc = d;
+        }
+    }
+    if (s->mb_huff_sel == HUFF_CUSTOM)
+        build_huff(&s->mb_desc, &s->mb_hc);
+    else
+        s->mb_hc = s->mb_huff[s->mb_huff_sel];
+}
+
+/**
+ * Lock word of a protected key frame, as verified by IR50_32.DLL
+ * (FUN_10023310): a function of the access key and the frame checksum.
+ */
+static uint32_t akey_lock(uint32_t k, uint32_t cs)
+{
+    uint32_t a = k & 0xFF;
+    uint32_t t = (a * 256 + 1 + (k >> 16)) * ((k & 0xFF00) + 1 + cs);
+    uint32_t u = t / (t % (a + 1) + 1);
+    return (u % ((cs & 0xFF00) + 1) + 1) * u;
+}
+
+/**
+ * Scramble (or descramble: XOR) the start of the first luma band of a
+ * protected key frame: up to 64 bytes after the band's flags and size, with
+ * a 16-bit LCG keystream seeded from the access key (IR50_32.DLL
+ * FUN_1001e020).
+ */
+static void akey_scramble(uint8_t *band, int band_size, uint32_t k)
+{
+    uint32_t mult = ((((k >> 8) & 0xFF) + (k & 0xFF) * 256) >> 1) + 0x4000;
+    uint32_t x = ~k >> 16;
+    int n = band_size < 0x44 ? (band_size - 4) & ~1 : 0x40;
+
+    mult = mult / 200 * 200 + 0x15;
+    for (int i = 0; i < n; i += 2) {
+        x = (mult * x + 1) & 0xFFFF;
+        band[4 + i]     ^= x;
+        band[4 + i + 1] ^= x >> 8;
+    }
+}
+
+static void put_le24(uint8_t *p, unsigned v)
+{
+    p[0] = v;
+    p[1] = v >> 8;
+    p[2] = v >> 16;
+}
+
+/**
+ * Write one complete band (header + single tile) at dst.
+ * @return number of bytes written
+ */
+static int write_band(Indeo5EncContext *s, EncBand *b, uint8_t *dst,
+                      size_t dst_size)
+{
+    const int blks = b->mb_size != b->blk_size ? 4 : 1;
+    PutBitContext pb;
+    int hdr_len, body_len, tile_hdr, total, pending = 0;
+    uint8_t *body;
+    WriteCtx w;
+    BandTables *t = s->tab;
+
+    int inter = s->frame_type != FT_INTRA;
+
+    choose_tables(s, b, t);
+
+    /* band header */
+    init_put_bits(&pb, dst, dst_size);
+    /* 0x80 block codebook signalled, 0x40 rvmap signalled, 0x10 corrections */
+    put_bits(&pb, 8, (t->huff_sel != IVI5_NUM_HUFF - 1 ? 0x80 : 0) |
+                     (t->rv_sel != IVI5_NUM_RVMAPS - 1 ? 0x40 : 0) |
+                     (t->num_corr ? 0x10 : 0) |
+                     (b->qdelta ? 0x04 : 0) |             /* quant deltas */
+                     (b->qdelta && b->inherit ? 0x08 : 0) | /* inherited */
+                     ((inter || s->quick) && b->inherit ? 0x02 : 0)); /* inherit MVs */
+    put_bits(&pb, 24, 0);            /* band data size, patched below */
+    if (t->num_corr) {
+        put_bits(&pb, 8, t->num_corr);
+        for (int i = 0; i < 2 * t->num_corr; i++)
+            put_bits(&pb, 8, t->corr[i]);
+    }
+    if (t->rv_sel != IVI5_NUM_RVMAPS - 1)
+        put_bits(&pb, 3, t->rv_sel);
+    if (t->huff_sel != IVI5_NUM_HUFF - 1)
+        put_bits(&pb, 3, t->huff_sel == HUFF_CUSTOM ? 7 : t->huff_sel);
+    if (t->huff_sel == HUFF_CUSTOM) {
+        put_bits(&pb, 4, t->desc.num_rows);
+        for (int i = 0; i < t->desc.num_rows; i++)
+            put_bits(&pb, 4, t->desc.xbits[i]);
+    }
+    put_bits(&pb, 1, s->checksums);  /* band checksum present */
+    if (s->checksums)
+        put_bits(&pb, 16, b->checksum);
+    put_bits(&pb, 5, s->quant);
+    flush_put_bits(&pb);
+    hdr_len = put_bytes_output(&pb);
+
+    total = hdr_len;
+    w.lut = &t->lut;
+    w.hc  = &t->hc;
+    w.nc  = b->blk_size * b->blk_size;
+    w.pb  = &pb;
+    for (int tile = 0; tile < b->ntiles; tile++) {
+        int k0 = b->tile_start[tile], k1 = b->tile_start[tile + 1];
+        int px = 0, py = 0, empty = inter, max_hdr;
+
+        /* a tile whose MBs are all empty is a single is_empty bit */
+        for (int k = k0; k < k1 && empty; k++) {
+            int m = b->order[k];
+            /* Intel copies empty tiles from the reference without motion
+             * compensation, so the vectors (also inherited ones) must be 0 */
+            empty = b->mb_empty[m] && !b->mb_mv[m][0] && !b->mb_mv[m][1] &&
+                    !(b->qdelta && !b->inherit && b->mb_qd[m]);
+        }
+        if (empty) {
+            pending++;
+            continue;
+        }
+
+        /* tile body (macroblock info + block data) is written after room for
+         * the longest header: the is_empty bits of the empty tiles before it,
+         * is_empty, size_present and a 32-bit size field */
+        max_hdr = (pending + 34 + 7) >> 3;
+        body = dst + total + max_hdr;
+        init_put_bits(&pb, body, dst_size - total - max_hdr);
+        for (int k = k0; k < k1; k++) {
+            int m = b->order[k];
+            if (!inter) {
+                put_bits(&pb, 1, 0); /* MB not empty; type implied intra */
+                put_bits(&pb, blks, b->cbp[m]);
+                if (b->qdelta && !b->inherit) {
+                    unsigned sq = mv_sym(b->mb_qd[m]);
+                    put_bits(&pb, s->mb_hc.bits[sq], s->mb_hc.code[sq]);
+                }
+                continue;
+            }
+            put_bits(&pb, 1, b->mb_empty[m]);
+            if (b->mb_empty[m]) {
+                if (b->qdelta && !b->inherit) {   /* frame flag 0x08 */
+                    unsigned sq = mv_sym(b->mb_qd[m]);
+                    put_bits(&pb, s->mb_hc.bits[sq], s->mb_hc.code[sq]);
+                }
+                continue;
+            }
+            if (!b->inherit)
+                put_bits(&pb, 1, b->mb_type[m]);
+            put_bits(&pb, blks, b->cbp[m]);
+            if (b->qdelta && !b->inherit) {
+                unsigned sq = mv_sym(b->mb_qd[m]);
+                put_bits(&pb, s->mb_hc.bits[sq], s->mb_hc.code[sq]);
+            }
+            if (!b->inherit && b->mb_type[m] == MB_INTER) {
+                /* vectors are kept in half-pels, coded in the band's unit */
+                int vx = b->mb_mv[m][0] >> !b->halfpel, vy = b->mb_mv[m][1] >> !b->halfpel;
+                unsigned sy = mv_sym(vy - py);
+                unsigned sx = mv_sym(vx - px);
+                put_bits(&pb, s->mb_hc.bits[sy], s->mb_hc.code[sy]);
+                put_bits(&pb, s->mb_hc.bits[sx], s->mb_hc.code[sx]);
+                px = vx;
+                py = vy;
+            }
+        }
+        flush_put_bits(&pb);
+        for_each_coded_block_range(b, k0, k1, write_block, &w);
+        flush_put_bits(&pb);
+        body_len = put_bytes_output(&pb);
+
+        /* tile header: the bits of preceding empty tiles, is_empty(1) +
+         * size_present(1) + size(8 [+24]), aligned. The size counts from the
+         * first of these bits (ivi.c decode_band() measures it from the end
+         * of the previous non-empty tile). */
+        tile_hdr = (pending + 10 + 7) >> 3;
+        if (tile_hdr + body_len >= 255)
+            tile_hdr = (pending + 34 + 7) >> 3;
+        if (tile_hdr != max_hdr)
+            memmove(dst + total + tile_hdr, body, body_len);
+        init_put_bits(&pb, dst + total, tile_hdr);
+        for (; pending > 0; pending--)
+            put_bits(&pb, 1, 1);
+        put_bits(&pb, 1, 0);
+        put_bits(&pb, 1, 1);
+        if (tile_hdr + body_len < 255) {
+            put_bits(&pb, 8, tile_hdr + body_len);
+        } else {
+            put_bits(&pb, 8, 255);
+            put_bits(&pb, 24, tile_hdr + body_len);
+        }
+        flush_put_bits(&pb);
+        total += tile_hdr + body_len;
+    }
+    if (pending) {                   /* trailing empty tiles */
+        init_put_bits(&pb, dst + total, (pending + 7) >> 3);
+        for (int i = 0; i < pending; i++)
+            put_bits(&pb, 1, 1);
+        flush_put_bits(&pb);
+        total += (pending + 7) >> 3;
+    }
+
+    put_le24(dst + 1, total);
+    return total;
+}
+
+/* Run-length symbols of the mask: runs of equal bits in coding order; a run
+ * longer than 255 is split into 255-pixel "continue" symbols (0). */
+static void trans_runs(const uint8_t *bits, int n, void (*cb)(void *, unsigned), void *opaque)
+{
+    for (int i = 0; i < n;) {
+        int j = i;
+        while (j < n && bits[j] == bits[i])
+            j++;
+        for (int len = j - i; ; len -= 255) {
+            if (len <= 255) {
+                cb(opaque, len);
+                break;
+            }
+            cb(opaque, 0);
+        }
+        i = j;
+    }
+}
+
+typedef struct TransWriteCtx {
+    PutBitContext *pb;
+    const HuffCodes *hc;
+} TransWriteCtx;
+
+static void trans_put(void *opaque, unsigned sym)
+{
+    TransWriteCtx *t = opaque;
+    put_bits(t->pb, t->hc->bits[sym], t->hc->code[sym]);
+}
+
+/* Mask bits of one transparency tile in coding order: rows of cw pixels
+ * (the tile width rounded up to 32; pixels right of the picture repeat its
+ * last column), optionally XORed with the previous row of the tile. */
+static void trans_bits(Indeo5EncContext *s, int w, int x0, int y0, int cw, int ch, int xor_rows)
+{
+    for (int y = 0; y < ch; y++)
+        for (int x = 0; x < cw; x++) {
+            const uint8_t *m = s->tmask + (y0 + y) * w + FFMIN(x0 + x, w - 1);
+            s->tbits[y * cw + x] = *m ^ (xor_rows && y ? m[-w] : 0);
+        }
+}
+
+/* Tile grid of the transparency plane (IR50_32.DLL FUN_1003eaf0 GOP parse,
+ * FUN_10050790): tile_size pixels in both profiles, or the whole picture;
+ * the last column ends at the picture width rounded up to 32. */
+static void trans_tile(int w, int h, int t, int i, int *x0, int *y0, int *cw, int *ch)
+{
+    int tw = !t || w < t ? w : t, th = !t || h < t ? h : t;
+    int cols = (w + tw - 1) / tw;
+    *x0 = i % cols * tw;
+    *y0 = i / cols * th;
+    *cw = FFMIN(FFALIGN(tw, 32), FFALIGN(w, 32) - *x0);
+    *ch = FFMIN(th, h - *y0);
+}
+
+/**
+ * Write the transparency plane that follows the colour bands (format of
+ * IR50_32.DLL FUN_10050c20 / FUN_10050790): 24-bit size, bounding rectangle
+ * of the opaque area, row-XOR flag, run-length codebook, then per tile in
+ * raster order either "1 v" (uniform) or "0 1 size (align) runs", where size
+ * counts the bytes from the start of the current bit run (the bits of
+ * preceding uniform tiles included) to the end of the runs.
+ * @return number of bytes written
+ */
+static int write_transparency(Indeo5EncContext *s, uint8_t *dst, size_t size, int w, int h)
+{
+    int t = s->tile_size;
+    int ntiles, x0 = w, y0 = h, x1 = -1, y1 = -1, best_xor = 0, any_rle = 0;
+    int pos, run_start, run_bits, len;
+    uint64_t best_bits = UINT64_MAX;
+    uint8_t *uniform = s->tuniform;
+    IVIHuffDesc desc, best_desc = { 2, { 0, 8 } };
+    HuffCodes hc;
+    PutBitContext pb;
+
+    {
+        int tw = !t || w < t ? w : t, th = !t || h < t ? h : t;
+        ntiles = ((w + tw - 1) / tw) * ((h + th - 1) / th);
+    }
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++)
+            if (s->tmask[y * w + x]) {
+                x0 = FFMIN(x0, x); x1 = FFMAX(x1, x);
+                y0 = FFMIN(y0, y); y1 = FFMAX(y1, y);
+            }
+    /* uniform tiles: 0 / 1 = all transparent / opaque, 2 = mixed */
+    for (int i = 0; i < ntiles; i++) {
+        int tx, ty, cw, ch, v;
+        trans_tile(w, h, t, i, &tx, &ty, &cw, &ch);
+        v = s->tmask[ty * w + tx];
+        for (int y = ty; y < ty + ch && v < 2; y++)
+            for (int x = tx; x < FFMIN(tx + cw, w); x++)
+                if (s->tmask[y * w + x] != v) {
+                    v = 2;
+                    break;
+                }
+        uniform[i] = v;
+        any_rle |= v == 2;
+    }
+
+    /* row XOR and the run-length codebook: one choice for all tiles */
+    for (int xr = 0; xr < 2 && any_rle; xr++) {
+        uint32_t hist[256] = { 0 };
+        uint64_t bits;
+        for (int i = 0; i < ntiles; i++) {
+            int tx, ty, cw, ch;
+            if (uniform[i] != 2)
+                continue;
+            trans_tile(w, h, t, i, &tx, &ty, &cw, &ch);
+            trans_bits(s, w, tx, ty, cw, ch, xr);
+            trans_runs(s->tbits, cw * ch, count_sym, hist);
+        }
+        bits = best_custom_desc(hist, &desc);
+        if (bits < best_bits) {
+            best_bits = bits;
+            best_xor  = xr;
+            best_desc = desc;
+        }
+    }
+    build_huff(&best_desc, &hc);
+
+    init_put_bits(&pb, dst, size);
+    put_bits(&pb, 24, 0);                    /* size, patched below */
+    put_bits(&pb, 3, 1);                     /* one bounding rectangle */
+    if (x1 >= 0) {
+        put_bits(&pb, 16, x0); put_bits(&pb, 16, y0);
+        put_bits(&pb, 16, x1 - x0 + 1); put_bits(&pb, 16, y1 - y0 + 1);
+    } else {
+        put_bits(&pb, 32, 0); put_bits(&pb, 32, 0);
+    }
+    put_bits(&pb, 1, best_xor);
+    put_bits(&pb, 1, 1);                     /* codebook (Intel always sends one) */
+    put_bits(&pb, 4, best_desc.num_rows);
+    for (int i = 0; i < best_desc.num_rows; i++)
+        put_bits(&pb, 4, best_desc.xbits[i]);
+    align_put_bits(&pb);
+    flush_put_bits(&pb);
+    pos = run_start = put_bytes_output(&pb);
+    run_bits = 0;
+    init_put_bits(&pb, dst + pos, size - pos);
+
+    for (int i = 0; i < ntiles; i++) {
+        int tx, ty, cw, ch, data_len, hdr_bits, total;
+        uint8_t *data;
+        PutBitContext db;
+        TransWriteCtx tw = { &db, &hc };
+
+        if (uniform[i] != 2) {
+            put_bits(&pb, 1, 1);
+            put_bits(&pb, 1, uniform[i]);
+            run_bits += 2;
+            continue;
+        }
+        /* runs into scratch space past the worst-case header */
+        trans_tile(w, h, t, i, &tx, &ty, &cw, &ch);
+        trans_bits(s, w, tx, ty, cw, ch, best_xor);
+        data = dst + run_start + ((run_bits + 34 + 7) >> 3);
+        if (data >= dst + size)
+            return AVERROR(ENOSPC);
+        init_put_bits(&db, data, dst + size - data);
+        put_bits(&db, 1, s->tbits[0]);
+        trans_runs(s->tbits, cw * ch, trans_put, &tw);
+        flush_put_bits(&db);
+        data_len = put_bytes_output(&db);
+
+        hdr_bits = run_bits + 10;
+        total    = ((hdr_bits + 7) >> 3) + data_len;
+        if (total >= 255) {
+            hdr_bits = run_bits + 34;
+            total    = ((hdr_bits + 7) >> 3) + data_len;
+        }
+        put_bits(&pb, 1, 0);
+        put_bits(&pb, 1, 1);
+        if (total < 255) {
+            put_bits(&pb, 8, total);
+        } else {
+            put_bits(&pb, 8, 255);
+            put_bits(&pb, 24, total);
+        }
+        align_put_bits(&pb);
+        flush_put_bits(&pb);
+        memmove(dst + run_start + ((hdr_bits + 7) >> 3), data, data_len);
+        pos = run_start = run_start + total;
+        run_bits = 0;
+        init_put_bits(&pb, dst + pos, size - pos);
+    }
+    flush_put_bits(&pb);
+    len = pos + put_bytes_output(&pb);
+    dst[0] = len; dst[1] = len >> 8; dst[2] = len >> 16;
+    return len;
+}
+
+/* Activity (variance) of each luma MB, and the MBs sorted flattest first. */
+static void compute_activity(Indeo5EncContext *s)
+{
+    EncBand *b = &s->bands[0];
+    const int mbs_x = b->aw / b->mb_size, n = mbs_x * (b->ah / b->mb_size);
+
+    for (int m = 0; m < n; m++) {
+        const float *src = b->buf + (m / mbs_x) * b->mb_size * b->aw + (m % mbs_x) * b->mb_size;
+        double sum = 0, sum2 = 0;
+        for (int y = 0; y < b->mb_size; y++)
+            for (int x = 0; x < b->mb_size; x++) {
+                double v = src[y * b->aw + x];
+                sum += v; sum2 += v * v;
+            }
+        sum /= b->mb_size * b->mb_size;
+        b->mb_act[m] = sum2 / (b->mb_size * b->mb_size) - sum * sum;
+        s->mb_order[m] = m;
+    }
+    /* insertion sort is fine for a few thousand MBs per frame */
+    for (int i = 1; i < n; i++) {
+        int v = s->mb_order[i], j = i;
+        while (j > 0 && b->mb_act[s->mb_order[j - 1]] > b->mb_act[v]) {
+            s->mb_order[j] = s->mb_order[j - 1];
+            j--;
+        }
+        s->mb_order[j] = v;
+    }
+}
+
+/**
+ * Per-MB quantizer deltas: activity-based (strength s->aq, busier MBs get a
+ * coarser quantizer) plus, for rate control, an extra -1 for the flattest
+ * s->aq_frac of the MBs.
+ */
+static void assign_qdelta(Indeo5EncContext *s)
+{
+    EncBand *b = &s->bands[0];
+    const int n = (b->aw / b->mb_size) * (b->ah / b->mb_size);
+    double mean = 0;
+    int any = 0;
+
+    if (b->inherit) {
+        b->qdelta = 0;
+        return;
+    }
+    if (s->quick && s->aq <= 0 && s->aq_frac <= 0) {
+        memset(b->mb_qd, 0, n * sizeof(*b->mb_qd));
+        b->qdelta = 1;
+        for (int i = 1; i < s->nb_bands; i++) {
+            s->bands[i].qdelta = 1;
+            memset(s->bands[i].mb_qd, 0, n * sizeof(*b->mb_qd));
+        }
+        return;
+    }
+    for (int m = 0; m < n; m++)
+        mean += log2(b->mb_act[m] + 16);
+    mean /= n;
+    for (int m = 0; m < n; m++) {
+        int d = s->aq > 0 ? lrintf(s->aq * (log2(b->mb_act[m] + 16) - mean)) : 0;
+        b->mb_qd[m] = av_clip(d, -4, 4);
+    }
+    for (int i = 0; i < lrintf(s->aq_frac * n); i++)
+        b->mb_qd[s->mb_order[i]]--;
+    for (int m = 0; m < n; m++) {
+        b->mb_qd[m] = av_clip(s->quant + b->mb_qd[m], 0, 23) - s->quant;
+        any |= b->mb_qd[m];
+    }
+    b->qdelta = !!any || s->quick;   /* IR50_QC always signals (zero) deltas */
+    /* as Intel: all other bands inherit the deltas of luma band 0 (band
+     * flags 0x04 | 0x08); the MB grids of all bands match */
+    for (int i = 1; i < s->nb_bands; i++) {
+        EncBand *o = &s->bands[i];
+        o->qdelta = b->qdelta;
+        memcpy(o->mb_qd, b->mb_qd, n * sizeof(*b->mb_qd));
+    }
+}
+
+/*
+ * The 3 bits after the MB codebook (IR50_32.DLL ctx+0xe8, tested in
+ * FUN_10034040): per plane (4 = Y, 2 = V, 1 = U) "no sample needs clipping",
+ * which lets Intel's decoder output the plane without its clipping table.
+ * Set for single-band planes whose reconstruction stays within -128..127.
+ */
+static int noclip_planes(const Indeo5EncContext *s)
+{
+    int bits = 0;
+    for (int i = 0; i < s->nb_bands; i++) {
+        const EncBand *b = &s->bands[i];
+        int ok = b->plane || s->luma_bands == 1;
+        for (int y = 0; y < b->height && ok; y++)
+            for (int x = 0; x < b->width; x++) {
+                int v = b->recon[y * b->pitch + x];
+                if (v < -128 || v > 127) {
+                    ok = 0;
+                    break;
+                }
+            }
+        if (ok)
+            bits |= 4 >> b->plane;
+    }
+    return bits;
+}
+
+/* Apply a trial luma mode and its inherited vectors to one MB. */
+static void rdo_mb_mode(Indeo5EncContext *s, int m, int mode)
+{
+    EncBand *l = &s->bands[0];
+    int vx = mode == 1 ? l->me_mv[m][0] : 0;
+    int vy = mode == 1 ? l->me_mv[m][1] : 0;
+
+    for (int i = 0; i < s->nb_bands; i++) {
+        EncBand *b = &s->bands[i];
+        int scale = (l->mb_size >> 3) - (b->mb_size >> 3);
+        int bs = b->blk_size, blks = b->mb_size == bs ? 1 : 4;
+        int mx = m % (b->aw / b->mb_size), my = m / (b->aw / b->mb_size);
+        b->mb_type[m] = mode ? MB_INTER : MB_INTRA;
+        b->mb_mv[m][0] = inherit_mv(vx, scale, l->halfpel);
+        b->mb_mv[m][1] = inherit_mv(vy, scale, l->halfpel);
+        if (!mode)
+            continue;
+        for (int blk = 0; blk < blks; blk++) {
+            int x0 = mx * b->mb_size + (blk & 1) * bs;
+            int y0 = my * b->mb_size + (blk >> 1) * bs;
+            int mc_type;
+            const int16_t *src = mc_source(b, x0, y0, b->mb_mv[m], &mc_type);
+            b->mc_no_delta(b->pred + y0 * b->pitch + x0, src, b->pitch, mc_type);
+        }
+    }
+}
+
+/* Choose intra, searched inter, zero-vector inter or zero-vector skip.
+ * Include distortion and residual bits of every inheriting band, as well
+ * as MB headers and differential MV lengths. Both DC and MV predictors
+ * follow the selected path and restart at tile boundaries. */
+static void rdo_mb_decisions(Indeo5EncContext *s, const RDOCtx *r)
+{
+    EncBand *l = &s->bands[0];
+    for (int t = 0; t < l->ntiles; t++) {
+        int dc[MAX_BANDS] = { 0 }, px = 0, py = 0;
+        for (int k = l->tile_start[t]; k < l->tile_start[t + 1]; k++) {
+            int m = l->order[k], best_mode = 1;
+            double best = INFINITY;
+            int best_dc[MAX_BANDS];
+            int16_t best_levels[MAX_BANDS][256];
+            uint8_t best_cbp[MAX_BANDS], best_empty[MAX_BANDS];
+            for (int mode = 0; mode < 4; mode++) {
+                int trial_dc[MAX_BANDS];
+                double cost = 0;
+                /* ME at zero and the explicit zero-vector candidate coincide. */
+                if (mode == 2 && !l->me_mv[m][0] && !l->me_mv[m][1])
+                    continue;
+                memcpy(trial_dc, dc, sizeof(dc));
+                rdo_mb_mode(s, m, mode);
+                for (int i = 0; i < s->nb_bands; i++) {
+                    EncBand *b = &s->bands[i];
+                    cost += quant_mb(b, m, s->quant, &r[i], &trial_dc[i], mode == 3, 1);
+                    cost += 1; /* empty flag */
+                    if (!b->mb_empty[m]) {
+                        cost += (b->mb_size == b->blk_size ? 1 : 4) + !b->inherit;
+                        if (!b->inherit && b->mb_type[m] == MB_INTER) {
+                            int vx = b->mb_mv[m][0] >> !b->halfpel;
+                            int vy = b->mb_mv[m][1] >> !b->halfpel;
+                            unsigned sx = mv_sym(vx - px), sy = mv_sym(vy - py);
+                            if (sx >= 256 || sy >= 256 || !s->mb_hc.bits[sx] || !s->mb_hc.bits[sy])
+                                cost = INFINITY;
+                            else
+                                cost += s->mb_hc.bits[sx] + s->mb_hc.bits[sy];
+                        }
+                    }
+                    if (cost >= best)
+                        break; /* Remaining bands cannot reduce the cost. */
+                }
+                if (cost < best) {
+                    best = cost;
+                    best_mode = mode;
+                    memcpy(best_dc, trial_dc, sizeof(best_dc));
+                    for (int i = 0; i < s->nb_bands; i++) {
+                        EncBand *b = &s->bands[i];
+                        int count = b->mb_size * b->mb_size;
+                        memcpy(best_levels[i], b->levels + m * count, count * sizeof(*b->levels));
+                        best_cbp[i] = b->cbp[m];
+                        best_empty[i] = b->mb_empty[m];
+                    }
+                }
+            }
+            rdo_mb_mode(s, m, best_mode);
+            if (best < INFINITY) {
+                memcpy(dc, best_dc, sizeof(dc));
+                for (int i = 0; i < s->nb_bands; i++) {
+                    EncBand *b = &s->bands[i];
+                    int count = b->mb_size * b->mb_size;
+                    memcpy(b->levels + m * count, best_levels[i], count * sizeof(*b->levels));
+                    b->cbp[m] = best_cbp[i];
+                    b->mb_empty[m] = best_empty[i];
+                }
+            } else {
+                for (int i = 0; i < s->nb_bands; i++)
+                    quant_mb(&s->bands[i], m, s->quant, &r[i], &dc[i], 0, 0);
+            }
+            if (!l->mb_empty[m] && l->mb_type[m] == MB_INTER) {
+                px = l->mb_mv[m][0] >> !l->halfpel;
+                py = l->mb_mv[m][1] >> !l->halfpel;
+            }
+        }
+    }
+}
+
+/**
+ * Quantize, reconstruct and write the whole frame at the given quantizer
+ * (MB decisions already made). @return the packet size in bytes
+ */
+static int code_frame(AVCodecContext *avctx, uint8_t *buf, size_t max_size)
+{
+    Indeo5EncContext *s = avctx->priv_data;
+    PutBitContext pb;
+    int gop_start, gop_len, pic_size_pos, len, pic_size_idx = 15;
+    unsigned frame_checksum = 0;
+    const int nl = s->luma_bands;
+
+    RDOCtx r[MAX_BANDS];
+
+    /* Each rate-control trial starts from the same motion-search decisions. */
+    if (s->frame_type != FT_INTRA) {
+        EncBand *l = &s->bands[0];
+        int n = (l->aw / l->mb_size) * (l->ah / l->mb_size);
+        for (int m = 0; m < n; m++) {
+            l->mb_type[m] = l->me_type[m];
+            l->mb_mv[m][0] = l->mb_type[m] == MB_INTER ? l->me_mv[m][0] : 0;
+            l->mb_mv[m][1] = l->mb_type[m] == MB_INTER ? l->me_mv[m][1] : 0;
+        }
+        for (int i = 0; i < s->nb_bands; i++) {
+            if (i)
+                inherit_decisions(s, &s->bands[i]);
+            predict_band(&s->bands[i]);
+        }
+    }
+    assign_qdelta(s);
+    for (int i = 0; i < s->nb_bands; i++) {
+        EncBand *b = &s->bands[i];
+        quant_band(b, s->quant, NULL);
+        if (s->rdo_cur > 0) {
+            BandTables *tab = &s->rd_tab[i];
+            choose_tables(s, b, tab);
+            huff_lengths(&tab->hc, r[i].len);
+            r[i].lut = &tab->lut;
+            r[i].k = s->rdo_cur * 0.1;
+        }
+    }
+    if (s->rdo_cur > 0) {
+        if (s->frame_type == FT_INTRA) {
+            for (int i = 0; i < s->nb_bands; i++)
+                quant_band(&s->bands[i], s->quant, &r[i]);
+        } else {
+            choose_mb_table(s);
+            rdo_mb_decisions(s, r);
+        }
+    }
+    for (int i = 0; i < s->nb_bands; i++)
+        recon_band(&s->bands[i], s->quant);
+    if (s->frame_type != FT_INTRA || s->bands[0].qdelta)
+        choose_mb_table(s);
+
+    for (int i = 0; i < 15; i++)
+        if (ivi5_common_pic_sizes[2 * i] * 4     == avctx->width &&
+            ivi5_common_pic_sizes[2 * i + 1] * 4 == avctx->height) {
+            pic_size_idx = i;
+            break;
+        }
+
+    init_put_bits(&pb, buf, max_size);
+    /* picture header */
+    put_bits(&pb, 5, 0x1F);          /* picture start code */
+    put_bits(&pb, 3, s->frame_type);
+    put_bits(&pb, 8, s->frame_idx & 0xFF); /* frame number, restarts at each GOP */
+
+    if (s->frame_type == FT_INTRA) {
+    /* GOP header */
+    gop_start = put_bits_count(&pb) >> 3;
+    /* gop flags: header size present, 0x80 as Intel, 0x40 tiles */
+    put_bits(&pb, 8, 0x81 | (s->tile_size ? 0x40 : 0) | (s->transparency ? 0x08 : 0) |
+                     (s->access_key >= 0 ? 0x20 : 0));
+    put_bits(&pb, 16, 0);            /* GOP header size, patched below */
+    if (s->access_key >= 0)
+        put_bits32(&pb, 0);          /* lock word, patched below */
+    if (s->tile_size)
+        put_bits(&pb, 2, av_log2(s->tile_size / 64));   /* tile = 64 << n */
+    put_bits(&pb, 2, nl == 4);       /* luma wavelet levels (bands = 3n+1) */
+    put_bits(&pb, 1, 0);             /* chroma wavelet levels: 1 band */
+    put_bits(&pb, 4, pic_size_idx);
+    if (pic_size_idx == 15) {        /* explicit picture size */
+        put_bits(&pb, 13, avctx->height);
+        put_bits(&pb, 13, avctx->width);
+    }
+    /* band descriptors for the luma bands and the (shared) chroma band:
+     * halfpel, MB = block flag, 4x4 block flag, ext. transform, end marker */
+    for (int i = 0; i <= nl; i++) {
+        const EncBand *b = &s->bands[i];
+        put_bits(&pb, 1, b->halfpel); /* half-pel vectors (Intel's offline encoder) */
+        put_bits(&pb, 1, b->mb_size == b->blk_size);
+        put_bits(&pb, 1, b->blk_size == 4);
+        put_bits(&pb, 1, 0);
+        put_bits(&pb, 2, 0);
+    }
+    if (s->transparency) {
+        put_bits(&pb, 3, 0);         /* alignment bits */
+        put_bits(&pb, 1, 1);         /* transparency fill colour present */
+        put_bits(&pb, 24, s->fill_rgb);
+    }
+    align_put_bits(&pb);
+    put_bits(&pb, 23, s->quick ? IVI5_GOP_STAMP_QC : IVI5_GOP_STAMP);
+    put_bits(&pb, 1, 0);             /* no GOP extension */
+    flush_put_bits(&pb);
+    gop_len = put_bytes_output(&pb) - gop_start;
+    AV_WL16(buf + gop_start + 1, gop_len);
+    }
+
+    /* rest of picture header */
+    /* band sizes, MB codebook, checksum, 0x04 (as Intel), picture size */
+    {
+        int intra_mbh = s->frame_type == FT_INTRA && !s->bands[0].qdelta;
+        int coded_mbh = intra_mbh || s->mb_huff_sel != IVI5_NUM_HUFF - 1;
+        put_bits(&pb, 8, 0x85 | (s->checksums ? 0x10 : 0) | (coded_mbh ? 0x40 : 0) |
+                         (s->bands[0].qdelta ? 0x08 : 0));  /* q_delta for all luma MBs */
+    }
+    pic_size_pos = put_bits_count(&pb) >> 3;
+    put_bits(&pb, 24, 0);            /* picture size, patched below */
+    if (s->checksums)
+        put_bits(&pb, 16, 0);        /* frame checksum, patched below */
+    if (s->frame_type == FT_INTRA && !s->bands[0].qdelta) {
+        put_bits(&pb, 3, 0);         /* MB codebook 0 (unused in intra frames) */
+    } else if (s->mb_huff_sel != IVI5_NUM_HUFF - 1) {
+        put_bits(&pb, 3, s->mb_huff_sel == HUFF_CUSTOM ? 7 : s->mb_huff_sel);
+        if (s->mb_huff_sel == HUFF_CUSTOM) {
+            put_bits(&pb, 4, s->mb_desc.num_rows);
+            for (int i = 0; i < s->mb_desc.num_rows; i++)
+                put_bits(&pb, 4, s->mb_desc.xbits[i]);
+        }
+    }
+    put_bits(&pb, 3, noclip_planes(s));
+    flush_put_bits(&pb);
+    len = put_bytes_output(&pb);
+
+    for (int i = 0; i < s->nb_bands; i++) {
+        int band_start = len;
+        len += write_band(s, &s->bands[i], buf + len, max_size - len - 16);
+        frame_checksum += s->bands[i].checksum;
+        if (!i && s->access_key >= 0 && s->frame_type == FT_INTRA)
+            akey_scramble(buf + band_start, len - band_start, s->access_key);
+    }
+    if (s->checksums)
+        AV_WL16(buf + pic_size_pos + 3, frame_checksum & 0xFFFF);
+    if (s->access_key >= 0 && s->frame_type == FT_INTRA)
+        AV_WL32(buf + 5, akey_lock(s->access_key, frame_checksum & 0xFFFF));
+    if (s->transparency) {
+        int tlen = write_transparency(s, buf + len, max_size - len - 16,
+                                      avctx->width, avctx->height);
+        if (tlen < 0)
+            return tlen;
+        len += tlen;
+    }
+
+    /* Zero padding. The Intel decoder recomputes the picture size as
+     * (bytes consumed + 8) & ~3 and rejects the frame (internal status 2,
+     * ICERR_ERROR) unless it equals the size field. */
+    {
+        int padded = (len + 8) & ~3;
+        memset(buf + len, 0, padded - len);
+        len = padded;
+    }
+    put_le24(buf + pic_size_pos, len);
+
+    return len;
+}
+
+/* Rate control: budget for the frame in bits. */
+static double rc_target(AVCodecContext *avctx, double *allocation)
+{
+    Indeo5EncContext *s = avctx->priv_data;
+    double fps = avctx->framerate.num > 0 ? av_q2d(avctx->framerate) : 1 / av_q2d(avctx->time_base);
+    double per_frame = avctx->bit_rate / fps;
+    int g = FFMAX(avctx->gop_size, 1);
+    /* key frames are rc_kratio times as large as P frames; the GOP as a
+     * whole gets g * per_frame */
+    double unit = g * per_frame / (s->rc_kratio + (g - 1));
+    double t = s->frame_type == FT_INTRA ? unit * s->rc_kratio : unit;
+    *allocation = t;
+    /* pay back (or spend) the accumulated deviation over about two seconds */
+    t -= s->rc_debt / (2 * fps);
+    return av_clipd(t, per_frame * 0.1, unit * s->rc_kratio * 2);
+}
+
+static int encode_frame(AVCodecContext *avctx, AVPacket *pkt,
+                        const AVFrame *frame, int *got_packet)
+{
+    Indeo5EncContext *s = avctx->priv_data;
+    uint8_t *buf;
+    int ret, len;
+    size_t max_size = s->max_size;
+    const int nl = s->luma_bands;
+    int rc = avctx->bit_rate > 0;
+    double rc_allocation = 0, rc_budget = 0;
+    int key;
+    const uint8_t *planes[3];
+    ptrdiff_t strides[3];
+
+    /* frame type: key frames every gop_size frames (and when requested),
+     * otherwise P frames. With "droppable", Intel's patterns are used:
+     * basic I d P d P (type 3), scalable I S S P S S P (type 2). */
+    if (s->frame_idx >= avctx->gop_size || avctx->gop_size <= 1 ||
+        frame->pict_type == AV_PICTURE_TYPE_I || s->force_key)
+        s->frame_idx = 0;
+    s->force_key = 0;
+    /* NULL frames leave the decoder's buffer state alone: the reference
+     * choice depends on the last frame that carried data */
+    if (s->frame_type != FT_NULL)
+        s->prev_type = s->frame_type;
+    if (!s->frame_idx)
+        s->frame_type = FT_INTRA;
+    else if (!s->droppable)
+        s->frame_type = FT_INTER;
+    else if (nl == 4)
+        s->frame_type = s->frame_idx % 3 ? FT_INTER_SCAL : FT_INTER;
+    else
+        s->frame_type = s->frame_idx & 1 ? FT_INTER_NOREF : FT_INTER;
+    key = s->frame_type == FT_INTRA;
+
+    /* reference as selected by the decoder's switch_buffers(): type 2
+     * frames following a type 2 frame use it, everything else the last
+     * I/P frame */
+    for (int i = 0; i < s->nb_bands; i++)
+        s->bands[i].mcref = s->frame_type == FT_INTER_SCAL && s->prev_type == FT_INTER_SCAL ?
+                            s->bands[i].sref : s->bands[i].ref;
+
+    /* plane order in the bitstream is Y, V, U (YVU9) */
+    if (s->transparency) {
+        int cw = (avctx->width + 3) >> 2;
+        prepare_transparent(s, frame, avctx->width, avctx->height);
+        planes[0] = s->ypl; strides[0] = avctx->width;
+        planes[1] = s->vpl; strides[1] = cw;
+        planes[2] = s->upl; strides[2] = cw;
+    } else {
+        planes[0] = frame->data[0]; strides[0] = frame->linesize[0];
+        planes[1] = frame->data[2]; strides[1] = frame->linesize[2];
+        planes[2] = frame->data[1]; strides[2] = frame->linesize[1];
+    }
+    if (nl == 4)
+        wavelet_analysis(s, planes[0], strides[0], avctx->width, avctx->height);
+    else
+        load_band(&s->bands[0], planes[0], strides[0]);
+    load_band(&s->bands[nl],     planes[1], strides[1]);
+    load_band(&s->bands[nl + 1], planes[2], strides[2]);
+    for (int i = 0; i < s->nb_bands; i++) {
+        EncBand *b = &s->bands[i];
+        memset(b->coef_valid, 0, (b->aw / b->blk_size) * (b->ah / b->blk_size));
+    }
+
+    /* the source did not change: a NULL frame (type 4, header only) keeps
+     * the decoder's picture as it is (both profiles; Intel's Quick Compress
+     * only uses them in the basic profile, but its decoder takes both) */
+    if (s->null_frames && s->frame_type == FT_INTER) {
+        int same = 1;
+        for (int i = 0; i < s->nb_bands && same; i++)
+            same = !memcmp(s->bands[i].buf, s->bands[i].prev_src,
+                           s->bands[i].aw * s->bands[i].ah * sizeof(float));
+        if (same) {
+            if ((ret = ff_get_encode_buffer(avctx, pkt, 2, 0)) < 0)
+                return ret;
+            pkt->data[0] = 0x1F | FT_NULL << 5;
+            pkt->data[1] = s->frame_idx & 0xFF;
+            if (rc) {
+                rc_budget = rc_target(avctx, &rc_allocation);
+                av_log(avctx, AV_LOG_DEBUG, "rc: type %d target %.0f bits 16 q %d rdo %.2f debt %.0f allocation %.0f\n",
+                       FT_NULL, rc_budget, s->quant, s->rdo_cur, s->rc_debt, rc_allocation);
+                s->rc_debt = av_clipd(s->rc_debt + 16 - rc_allocation,
+                                      -0.15 * avctx->bit_rate, 2.0 * avctx->bit_rate);
+            }
+            s->frame_type = FT_NULL;
+            s->frame_idx++;
+            *got_packet = 1;
+            return 0;
+        }
+    }
+    if (s->null_frames)
+        for (int i = 0; i < s->nb_bands; i++)
+            memcpy(s->bands[i].prev_src, s->bands[i].buf,
+                   s->bands[i].aw * s->bands[i].ah * sizeof(float));
+
+    if (rc)
+        s->quant = s->rc_q[!key];
+    s->aq_frac = 0;
+    compute_activity(s);
+
+    /* MB decisions and motion-compensated prediction */
+    for (int i = 0; i < s->nb_bands; i++) {
+        EncBand *b = &s->bands[i];
+        int n = (b->aw / b->mb_size) * (b->ah / b->mb_size);
+        if (key) {
+            memset(b->mb_type, MB_INTRA, n);
+            memset(b->mb_mv, 0, n * sizeof(*b->mb_mv));
+        } else {
+            if (b->inherit)
+                inherit_decisions(s, b);
+            else
+                luma_decisions(s);
+            predict_band(b);
+        }
+    }
+
+    if ((ret = ff_get_encode_buffer(avctx, pkt, max_size, 0)) < 0)
+        return ret;
+    buf = pkt->data;
+
+    s->rdo_cur = s->rdo * (rc ? s->rdo_scale : 1);
+    if ((len = code_frame(avctx, buf, max_size)) < 0)
+        return len;
+
+    if (rc) {
+        /* trial encodes: move the quantizer towards the budget, within a
+         * limited distance of the last quantizer of the same frame type
+         * (avoids oscillation and visible quality jumps) */
+        double target = rc_budget = rc_target(avctx, &rc_allocation);
+        int last = s->rc_q[!key], swing = key ? 3 : 2;
+        int initial = !s->rc_seen[!key];
+        int qlo = initial ? s->rc_qmin : FFMAX(s->rc_qmin, last - swing);
+        int qhi = initial ? s->rc_qmax : FFMIN(s->rc_qmax, last + swing);
+        int best_q = s->quant, best_len = len;
+        int search_lo = qlo, search_hi = qhi;
+#define RC_BETTER(l, bl) (((l) * 8 <= target * 1.05) != ((bl) * 8 <= target * 1.05) ? \
+                          (l) * 8 <= target * 1.05 : fabs((l) * 8 - target) < fabs((bl) * 8 - target))
+        for (int trial = 0; trial < (initial ? 6 : 3); trial++) {
+            double ratio = len * 8 / target;
+            int step = ratio > 2 ? 3 : ratio > 1.25 ? 2 : ratio > 1.05 ? 1 :
+                       ratio < 0.5 ? -3 : ratio < 0.75 ? -2 : ratio < 0.9 ? -1 : 0;
+            if (initial && (ratio > 2 || ratio < 0.5))
+                step = av_clip(lrint(log(ratio) / 0.2), -8, 8);
+            int q;
+            /* Keep the bracket when a large step crosses the target. Without
+             * this, trials can bounce between q=0 and q=3, missing q=1. */
+            if (step > 0)
+                search_lo = FFMAX(search_lo, s->quant + 1);
+            else if (step < 0)
+                search_hi = FFMIN(search_hi, s->quant - 1);
+            if (!step || search_lo > search_hi)
+                break;
+            q = av_clip(s->quant + step, search_lo, search_hi);
+            s->quant = q;
+            if ((len = code_frame(avctx, buf, max_size)) < 0)
+                return len;
+            if (RC_BETTER(len, best_len)) {
+                best_q = q;
+                best_len = len;
+            }
+        }
+#undef RC_BETTER
+        if (s->quant != best_q) {
+            s->quant = best_q;
+            if ((len = code_frame(avctx, buf, max_size)) < 0)
+                return len;
+        }
+        /* Fill quantizer gaps with a fraction of lower-quantizer MBs.
+         * Size is nonlinear after trellis and mode selection, so bracket the
+         * fraction rather than discarding an overshooting interpolation. */
+        if (len * 8 < target * 0.9 && s->quant > s->rc_qmin) {
+            int base_len = len, best_len = len;
+            float lo = 0, hi = 1, best_frac = 0;
+            s->aq_frac = 1;
+            if ((len = code_frame(avctx, buf, max_size)) < 0)
+                return len;
+            if (len > base_len) {
+                if (len * 8 <= target * 1.05) {
+                    best_len = len;
+                    best_frac = 1;
+                } else {
+                    s->aq_frac = av_clipf((target / 8 - base_len) / (len - base_len), 0, 1);
+                    for (int trial = 0; trial < 4; trial++) {
+                        if ((len = code_frame(avctx, buf, max_size)) < 0)
+                            return len;
+                        if (len * 8 <= target * 1.05 &&
+                            fabs(len * 8 - target) < fabs(best_len * 8 - target)) {
+                            best_len = len;
+                            best_frac = s->aq_frac;
+                        }
+                        if (len * 8 >= target * 0.95 && len * 8 <= target * 1.05)
+                            break;
+                        if (len * 8 > target)
+                            hi = s->aq_frac;
+                        else
+                            lo = s->aq_frac;
+                        s->aq_frac = (lo + hi) * 0.5;
+                    }
+                }
+            }
+            /* Re-encode the chosen fraction to restore coefficients and
+             * reconstruction, even when the final trial was rejected. */
+            s->aq_frac = best_frac;
+            if ((len = code_frame(avctx, buf, max_size)) < 0)
+                return len;
+        }
+        /* at the lowest quantizer RDO still drops coefficients, so high
+         * targets can be out of reach: then weaken RDO, slowly and only
+         * there (a low quantizer with strong RDO beats a higher quantizer
+         * with weak RDO), and restore it once the quantizer has room again */
+        if (s->rdo > 0) {
+            if (s->quant <= s->rc_qmin && len * 8 < target * 0.9)
+                s->rdo_scale *= 0.7;
+            else if (s->quant > s->rc_qmin + 1)
+                s->rdo_scale = FFMIN(FFMAX(s->rdo_scale, 0.03) * 1.25, 1);
+            if (s->rdo_scale < 0.03)
+                s->rdo_scale = 0;
+        }
+        s->rc_q[!key] = s->quant;
+        s->rc_seen[!key] = 1;
+        if (!key)
+            s->rc_q[0] = av_clip(s->quant - 1, s->rc_qmin, s->rc_qmax);
+        /* learn the key/P size ratio at comparable quantizers */
+        if (key)
+            s->rc_isize = len * 8;
+        else
+            s->rc_psize = s->rc_psize ? 0.8 * s->rc_psize + 0.2 * len * 8 : len * 8;
+        if (s->rc_isize && s->rc_psize)
+            s->rc_kratio = av_clipd(s->rc_isize / s->rc_psize, 1.5, 12);
+    }
+
+    /* nothing changed: a NULL frame (type 4, header only). The decoder
+     * keeps its buffers untouched. */
+    if (s->null_frames && s->frame_type == FT_INTER) {
+        int all_empty = 1;
+        for (int i = 0; i < s->nb_bands && all_empty; i++) {
+            const EncBand *b = &s->bands[i];
+            for (int m = 0; m < (b->aw / b->mb_size) * (b->ah / b->mb_size); m++)
+                if (!b->mb_empty[m] || b->mb_mv[m][0] || b->mb_mv[m][1]) {
+                    all_empty = 0;
+                    break;
+                }
+        }
+        if (all_empty) {
+            buf[0] = 0x1F | FT_NULL << 5;
+            buf[1] = s->frame_idx & 0xFF;
+            len = 2;
+            s->frame_type = FT_NULL;
+        }
+    }
+
+    if (rc) {
+        av_log(avctx, AV_LOG_DEBUG, "rc: type %d target %.0f bits %d q %d rdo %.2f debt %.0f allocation %.0f\n",
+               s->frame_type, rc_budget, len * 8, s->quant, s->rdo_cur, s->rc_debt, rc_allocation);
+        /* Account final packet bytes (including NULL substitution) against
+         * the uncorrected allocation: successful repayment reduces debt.
+         * Bound unused credit to 0.15 seconds and excess to two seconds. */
+        s->rc_debt = av_clipd(s->rc_debt + len * 8 - rc_allocation,
+                              -0.15 * avctx->bit_rate, 2.0 * avctx->bit_rate);
+    }
+    av_shrink_packet(pkt, len);
+    if (key)
+        pkt->flags |= AV_PKT_FLAG_KEY;
+    *got_packet = 1;
+
+    /* I and P frames become the reference, type 2 frames the reference of
+     * the next type 2 frame, type 3 and NULL frames nothing */
+    for (int i = 0; i < s->nb_bands; i++) {
+        if (s->frame_type == FT_INTRA || s->frame_type == FT_INTER)
+            FFSWAP(int16_t *, s->bands[i].ref, s->bands[i].recon);
+        else if (s->frame_type == FT_INTER_SCAL)
+            FFSWAP(int16_t *, s->bands[i].sref, s->bands[i].recon);
+    }
+    s->frame_idx++;
+    return 0;
+}
+
+static av_cold int encode_close(AVCodecContext *avctx)
+{
+    Indeo5EncContext *s = avctx->priv_data;
+
+    for (int i = 0; i < MAX_BANDS; i++) {
+        av_freep(&s->bands[i].buf);
+        av_freep(&s->bands[i].prev_src);
+        av_freep(&s->bands[i].levels);
+        for (int j = 0; j < 3; j++)
+            av_freep(&s->bands[i].coef_cache[j]);
+        av_freep(&s->bands[i].coef_valid);
+        av_freep(&s->bands[i].coef_mv);
+        av_freep(&s->bands[i].cbp);
+        av_freep(&s->bands[i].recon);
+        av_freep(&s->bands[i].ref);
+        av_freep(&s->bands[i].sref);
+        av_freep(&s->bands[i].pred);
+        av_freep(&s->bands[i].mb_type);
+        av_freep(&s->bands[i].mb_empty);
+        av_freep(&s->bands[i].mb_mv);
+        av_freep(&s->bands[i].me_mv);
+        av_freep(&s->bands[i].me_type);
+        av_freep(&s->bands[i].mb_qd);
+        av_freep(&s->bands[i].mb_act);
+        av_freep(&s->bands[i].order);
+        av_freep(&s->bands[i].tile_start);
+    }
+    av_freep(&s->tab);
+    av_freep(&s->mb_order);
+    av_freep(&s->tmask);
+    av_freep(&s->tuniform);
+    av_freep(&s->ypl);
+    av_freep(&s->vpl);
+    av_freep(&s->upl);
+    av_freep(&s->vfull);
+    av_freep(&s->ufull);
+    av_freep(&s->tbits);
+    banded_free(&s->lu_h);
+    banded_free(&s->lu_v);
+    av_freep(&s->wl_buf);
+    av_freep(&s->wl_line);
+    return 0;
+}
+
+#define OFFSET(x) offsetof(Indeo5EncContext, x)
+#define VE AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM
+static const AVOption options[] = {
+    { "quant", "global quantizer (0 = best quality, 23 = smallest)",
+      OFFSET(quant), AV_OPT_TYPE_INT, { .i64 = 6 }, 0, 23, VE },
+    { "quality", "Intel quality 0..10000 (overrides quant; Intel's default is 8500)",
+      OFFSET(quality), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, 10000, VE },
+    { "tables", "entropy table optimisation: 0 static only, 1 + custom codebooks, 2 + rvmap corrections",
+      OFFSET(tables), AV_OPT_TYPE_INT, { .i64 = 2 }, 0, 2, VE },
+    { "aq_strength", "adaptive quantization strength (per-MB quantizer deltas from activity), 0 = off",
+      OFFSET(aq), AV_OPT_TYPE_FLOAT, { .dbl = 0 }, 0, 4, VE },
+    { "droppable", "alternate P and droppable P frames (Intel's I d P d P pattern)",
+      OFFSET(droppable), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VE },
+    { "rc_qmin", "rate control: lowest quantizer",
+      OFFSET(rc_qmin), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 23, VE },
+    { "rc_qmax", "rate control: highest quantizer",
+      OFFSET(rc_qmax), AV_OPT_TYPE_INT, { .i64 = 23 }, 0, 23, VE },
+    { "me_range", "motion search range in half-pels",
+      OFFSET(me_range), AV_OPT_TYPE_INT, { .i64 = 24 }, 0, 60, VE },
+    { "tile_size", "tiles for local decoding (Intel's minimum viewport): 0 = off, 64, 128, 256",
+      OFFSET(tile_size), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 256, VE },
+    { "null_frames", "code P frames without any change as NULL frames",
+      OFFSET(null_frames), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VE },
+    { "quick", "Intel Quick Compress style encoding: full-pel motion search, static tables",
+      OFFSET(quick), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VE },
+    { "access_key", "Intel access key (copy protection, 0..4294967295), -1 = none",
+      OFFSET(access_key), AV_OPT_TYPE_INT64, { .i64 = -1 }, -1, UINT32_MAX, VE },
+    { "transparency", "transparency plane source",
+      OFFSET(transparency), AV_OPT_TYPE_INT, { .i64 = TRANS_NONE }, TRANS_NONE, TRANS_FRAME, VE, .unit = "transparency" },
+    { "none",        "no transparency", 0, AV_OPT_TYPE_CONST, { .i64 = TRANS_NONE },  0, 0, VE, .unit = "transparency" },
+    { "alpha",       "alpha channel (yuva420p input, alpha >= 128 = opaque)",
+      0, AV_OPT_TYPE_CONST, { .i64 = TRANS_ALPHA }, 0, 0, VE, .unit = "transparency" },
+    { "range",       "colour key between transparency_lo and transparency_hi (bgr24 input)",
+      0, AV_OPT_TYPE_CONST, { .i64 = TRANS_RANGE }, 0, 0, VE, .unit = "transparency" },
+    { "first_frame", "colour key range derived from the first frame, which shows only the backdrop (bgr24 input)",
+      0, AV_OPT_TYPE_CONST, { .i64 = TRANS_FRAME }, 0, 0, VE, .unit = "transparency" },
+    { "transparency_lo", "range mode: lowest key colour",
+      OFFSET(key_lo), AV_OPT_TYPE_COLOR, { .str = "black" }, 0, 0, VE },
+    { "transparency_hi", "range mode: highest key colour",
+      OFFSET(key_hi), AV_OPT_TYPE_COLOR, { .str = "black" }, 0, 0, VE },
+    { "luma_bands", "1 = basic profile, 4 = scalable (wavelet) profile",
+      OFFSET(luma_bands), AV_OPT_TYPE_INT, { .i64 = 1 }, 1, 4, VE },
+    { "hh_band", "encode scalable diagonal detail (disable for identical scalar/MMX reconstruction)",
+      OFFSET(hh_band), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, VE },
+    { "rdo", "trellis quantization and macroblock rate-distortion strength, 0 = off, -1 = auto (1, quick mode 0)",
+      OFFSET(rdo), AV_OPT_TYPE_FLOAT, { .dbl = -1 }, -1, 10, VE },
+    { "checksum", "write frame/band checksums (default: yes, except in quick mode, as Intel)",
+      OFFSET(checksums), AV_OPT_TYPE_BOOL, { .i64 = -1 }, -1, 1, VE },
+    { NULL },
+};
+
+static const AVClass indeo5enc_class = {
+    .class_name = "indeo5 encoder",
+    .item_name  = av_default_item_name,
+    .option     = options,
+    .version    = LIBAVUTIL_VERSION_INT,
+};
+
+static int indeo5_get_supported_config(const AVCodecContext *avctx,
+                                       const AVCodec *codec,
+                                       enum AVCodecConfig config,
+                                       unsigned flags, const void **out,
+                                       int *out_num)
+{
+    if (config == AV_CODEC_CONFIG_PIX_FORMAT) {
+        static const enum AVPixelFormat yvu9[] = { AV_PIX_FMT_YUV410P, AV_PIX_FMT_NONE };
+        static const enum AVPixelFormat yuva[] = { AV_PIX_FMT_YUVA420P, AV_PIX_FMT_NONE };
+        static const enum AVPixelFormat bgr[]  = { AV_PIX_FMT_BGR24, AV_PIX_FMT_NONE };
+        static const enum AVPixelFormat all[]  = { AV_PIX_FMT_YUV410P, AV_PIX_FMT_YUVA420P,
+                                                   AV_PIX_FMT_BGR24, AV_PIX_FMT_NONE };
+        const Indeo5EncContext *s = avctx && avctx->priv_data ? avctx->priv_data : NULL;
+        /* the alpha-capable / RGB formats only for the transparency modes
+         * that need them, so that ordinary sources keep going through yuv410p */
+        *out = !s ? all : s->transparency == TRANS_ALPHA ? yuva :
+               s->transparency ? bgr : yvu9;
+        *out_num = !s ? 3 : 1;
+        return 0;
+    }
+    return ff_default_get_supported_config(avctx, codec, config, flags, out, out_num);
+}
+
+static const FFCodecDefault indeo5enc_defaults[] = {
+    { "g", "15" },                   /* Intel's default key frame interval */
+    { "b", "0" },                    /* constant quantizer unless -b:v is given */
+    { NULL },
+};
+
+const FFCodec ff_indeo5_encoder = {
+    .p.name         = "indeo5",
+    CODEC_LONG_NAME("Intel Indeo Video Interactive 5"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_INDEO5,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE,
+    .priv_data_size = sizeof(Indeo5EncContext),
+    .p.priv_class   = &indeo5enc_class,
+    .init           = encode_init,
+    FF_CODEC_ENCODE_CB(encode_frame),
+    .close          = encode_close,
+    CODEC_PIXFMTS(AV_PIX_FMT_YUV410P, AV_PIX_FMT_YUVA420P, AV_PIX_FMT_BGR24),
+    .get_supported_config = indeo5_get_supported_config,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
+    .defaults       = indeo5enc_defaults,
+};

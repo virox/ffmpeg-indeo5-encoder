@@ -4,9 +4,10 @@
 
 | Path | What |
 |---|---|
-| `ffmpeg/` | FFmpeg git checkout (615b071) with the encoder added |
-| `ffmpeg/libavcodec/indeo5enc.c` | the encoder (new file) |
-| `indeo5enc.patch` | all FFmpeg changes (encoder, `allcodecs.c`, `Makefile`, `configure`; decoder: `ivi_dsp.c` synthesis fix, access key and transparency-region synthesis in `indeo5.c`/`ivi.c`/`ivi.h`) |
+| `ffmpeg/` | FFmpeg git checkout (615b071) with `scripts/apply.sh` applied (not tracked in git) |
+| `patches/0001-*.patch` | decoder changes: `ivi_dsp.c` synthesis fix, access key and transparency-region synthesis in `indeo5.c`/`ivi.c`/`ivi.h` |
+| `patches/0002-*.patch` | build wiring: `allcodecs.c`, `Makefile`, `configure` |
+| `src/libavcodec/indeo5enc.c` | the encoder (canonical copy; `scripts/apply.sh` adds it to an FFmpeg checkout, `scripts/export.sh` regenerates `src/` and `patches/` from a modified `ffmpeg/`) |
 | `tools/iv5hdr.py` | dumps IV50 picture/GOP/band headers of an AVI |
 | `tools/checksums.py` | checks frame/band checksums against decoded YVU9 |
 | `tools/avi2frames.py` | extracts AVI video frames as `[u32 size][data]` records |

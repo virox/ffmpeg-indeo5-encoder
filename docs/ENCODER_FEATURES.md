@@ -28,7 +28,7 @@ Evidence legend:
 
 | Source | Location | Notes |
 |---|---|---|
-| Full decompilation (856 functions) | `re/ir50_32_decomp.c` | Ghidra 12.1.4 headless, `re/ghidra_scripts/DecompileAll.java`; print one function with `tools/fn.sh <addr>` |
+| Full decompilation (856 functions) | `re/ir50_32_decomp.c` | Ghidra 12.1.4 headless, `tools/ghidra/DecompileAll.java`; print one function with `tools/fn.sh <addr>` |
 | REA session snapshot | `re/ir50_32.rea-snapshot` | REA (Ghidra provider) analysis with the transparency evidence; reopen with `open_binary` + `snapshot_path` |
 | Resources | `re/ir50_32_resources.txt` | dialogs, string table, version; extracted with `tools/pe_resources.py` |
 | OLE type library | `re/ir50_typelib.tlb`, `re/typelib.bin.txt` | `IIndeoEncodeOA` / `IIndeoDecodeOA` property names and help strings |

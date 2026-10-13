@@ -88,4 +88,4 @@ The expanded matrix passes all **80 cases on MMX and 80 on scalar**, with
 zero luma differences, decode errors or checksum mismatches. This includes
 QC176 alpha transparency, the DC guard fix, access keys, tiling, NULL and
 droppable frames. HH detail, RC bookkeeping and RDO recovery checks also pass.
-The normal binary, checksum-verifying binary and `indeo5enc.patch` are updated.
+The normal binary, checksum-verifying binary and `src/` and `patches/` (via `scripts/export.sh`) are updated.

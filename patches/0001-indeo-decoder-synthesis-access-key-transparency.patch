@@ -1,0 +1,598 @@
+diff --git a/libavcodec/indeo5.c b/libavcodec/indeo5.c
+index 594b97b..0bd77ec 100644
+--- a/libavcodec/indeo5.c
++++ b/libavcodec/indeo5.c
+@@ -28,6 +28,7 @@
+  */
+ 
+ #include "libavutil/attributes.h"
++#include "libavutil/opt.h"
+ #define BITSTREAM_READER_LE
+ #include "avcodec.h"
+ #include "codec_internal.h"
+@@ -684,12 +685,34 @@ static av_cold int decode_init(AVCodecContext *avctx)
+     return 0;
+ }
+ 
++static const AVOption options[] = {
++    { "scalable_synthesis", "scalable synthesis path (Intel MMX uses HH; scalar omits it)",
++      offsetof(IVI45DecContext, scalar_synthesis), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 1,
++      AV_OPT_FLAG_DECODING_PARAM | AV_OPT_FLAG_VIDEO_PARAM, .unit = "scalable_synthesis" },
++    { "mmx", "Intel MMX synthesis, including the HH band", 0, AV_OPT_TYPE_CONST,
++      { .i64 = 0 }, 0, 0, AV_OPT_FLAG_DECODING_PARAM | AV_OPT_FLAG_VIDEO_PARAM, .unit = "scalable_synthesis" },
++    { "scalar", "Intel scalar synthesis, omitting HH", 0, AV_OPT_TYPE_CONST,
++      { .i64 = 1 }, 0, 0, AV_OPT_FLAG_DECODING_PARAM | AV_OPT_FLAG_VIDEO_PARAM, .unit = "scalable_synthesis" },
++    { "access_key", "access key of protected clips (0..4294967295)",
++      offsetof(IVI45DecContext, access_key), AV_OPT_TYPE_INT64, { .i64 = -1 }, -1, UINT32_MAX,
++      AV_OPT_FLAG_DECODING_PARAM | AV_OPT_FLAG_VIDEO_PARAM },
++    { NULL },
++};
++
++static const AVClass indeo5_class = {
++    .class_name = "indeo5 decoder",
++    .item_name  = av_default_item_name,
++    .option     = options,
++    .version    = LIBAVUTIL_VERSION_INT,
++};
++
+ const FFCodec ff_indeo5_decoder = {
+     .p.name         = "indeo5",
+     CODEC_LONG_NAME("Intel Indeo Video Interactive 5"),
+     .p.type         = AVMEDIA_TYPE_VIDEO,
+     .p.id           = AV_CODEC_ID_INDEO5,
+     .priv_data_size = sizeof(IVI45DecContext),
++    .p.priv_class   = &indeo5_class,
+     .init           = decode_init,
+     .close          = ff_ivi_decode_close,
+     FF_CODEC_DECODE_CB(ff_ivi_decode_frame),
+diff --git a/libavcodec/ivi.c b/libavcodec/ivi.c
+index a38f382..da2dbf0 100644
+--- a/libavcodec/ivi.c
++++ b/libavcodec/ivi.c
+@@ -730,6 +730,18 @@ static int ivi_decode_blocks(GetBitContext *gb, const IVIBandDesc *band,
+ 
+             cbp >>= 1;
+         }// for blk
++
++        /* Intel's scalable Quick Compress path reconstructs an uncoded
++         * eight-column LL guard block with the current intra DC predictor.
++         * This predictor also carries across inter MBs until the next intra
++         * block updates it. The synthesis viewport includes these samples. */
++        if (avctx->codec_id == AV_CODEC_ID_INDEO5 &&
++            !band->plane && !band->band_num &&
++            band->mb_size == 8 && band->blk_size == 8 &&
++            mb->xpos + 8 >= band->width && ((mb->xpos + 8) & 15) &&
++            mb->xpos + 16 <= band->pitch && mb->ypos + 8 <= band->aheight)
++            band->dc_transform(&prev_dc, band->buf + mb->buf_offs + 8,
++                               band->pitch, 8);
+     }// for mbn
+ 
+     align_get_bits(gb);
+@@ -747,7 +759,7 @@ static int ivi_decode_blocks(GetBitContext *gb, const IVIBandDesc *band,
+  *  @param[in]  mv_scale  scaling factor for motion vectors
+  */
+ static int ivi_process_empty_tile(AVCodecContext *avctx, const IVIBandDesc *band,
+-                                  IVITile *tile, int32_t mv_scale)
++                                  IVITile *tile, int32_t mv_scale, int is_indeo5)
+ {
+     int             x, y, need_mc, mbn, blk, num_blocks, mv_x, mv_y, mc_type;
+     int             offs, mb_offset, row_offset, ret;
+@@ -755,7 +767,10 @@ static int ivi_process_empty_tile(AVCodecContext *avctx, const IVIBandDesc *band
+     const int16_t   *src;
+     int16_t         *dst;
+     ivi_mc_func     mc_no_delta_func;
+-    int             clear_first = !band->qdelta_present && !band->plane && !band->band_num;
++    /* Indeo 5 (IR50_32.DLL FUN_10025320): the luma band 0 MBs of an empty
++     * tile always get zero vectors, and the tile is copied from the
++     * reference without motion compensation, also in bands inheriting MVs */
++    int             clear_first = (is_indeo5 || !band->qdelta_present) && !band->plane && !band->band_num;
+     int             mb_size     = band->mb_size;
+     int             xend        = tile->xpos + tile->width;
+     int             is_halfpel  = band->is_halfpel;
+@@ -786,7 +801,9 @@ static int ivi_process_empty_tile(AVCodecContext *avctx, const IVIBandDesc *band
+             mb->cbp  = 0; /* all blocks are empty */
+ 
+             if (clear_first) {
+-                mb->q_delta = band->glob_quant;
++                /* Intel stores the band quantizer itself, i.e. a delta of 0
++                 * (quant = glob_quant + q_delta, inherited by other bands) */
++                mb->q_delta = is_indeo5 ? 0 : band->glob_quant;
+                 mb->mv_x    = 0;
+                 mb->mv_y    = 0;
+             }
+@@ -831,7 +848,7 @@ static int ivi_process_empty_tile(AVCodecContext *avctx, const IVIBandDesc *band
+         offs += row_offset;
+     } // for y
+ 
+-    if (band->inherit_mv && need_mc) { /* apply motion compensation if there is at least one non-zero motion vector */
++    if (band->inherit_mv && need_mc && !is_indeo5) { /* apply motion compensation if there is at least one non-zero motion vector */
+         num_blocks = (mb_size != band->blk_size) ? 4 : 1; /* number of blocks per mb */
+         mc_no_delta_func = (band->blk_size == 8) ? ff_ivi_mc_8x8_no_delta
+                                                  : ff_ivi_mc_4x4_no_delta;
+@@ -857,11 +874,23 @@ static int ivi_process_empty_tile(AVCodecContext *avctx, const IVIBandDesc *band
+             }
+         }
+     } else {
+-        /* copy data from the reference tile into the current one */
++        /* copy data from the reference tile into the current one; Indeo 5
++         * copies whole macroblocks, as decoding a coded tile writes them */
++        int cw = tile->width, ch = tile->height;
++        if (is_indeo5) {
++            cw = FFMIN(FFALIGN(cw, mb_size), pitch - tile->xpos);
++            ch = FFMIN(FFALIGN(ch, mb_size), band->aheight - tile->ypos);
++            /* Empty QC LL tiles copy the guard samples from the reference,
++             * unlike coded tiles, which synthesize them from the DC predictor. */
++            if (!band->plane && !band->band_num && mb_size == 8 &&
++                tile->xpos + tile->width >= band->width)
++                cw = FFMIN(FFALIGN(tile->xpos + cw, 16) - tile->xpos,
++                           pitch - tile->xpos);
++        }
+         src = band->ref_buf + tile->ypos * pitch + tile->xpos;
+         dst = band->buf     + tile->ypos * pitch + tile->xpos;
+-        for (y = 0; y < tile->height; y++) {
+-            memcpy(dst, src, tile->width*sizeof(band->buf[0]));
++        for (y = 0; y < ch; y++) {
++            memcpy(dst, src, cw * sizeof(band->buf[0]));
+             src += pitch;
+             dst += pitch;
+         }
+@@ -1004,7 +1033,8 @@ static int decode_band(IVI45DecContext *ctx,
+         tile->is_empty = get_bits1(&ctx->gb);
+         if (tile->is_empty) {
+             result = ivi_process_empty_tile(avctx, band, tile,
+-                                      (ctx->planes[0].bands[0].mb_size >> 3) - (band->mb_size >> 3));
++                                      (ctx->planes[0].bands[0].mb_size >> 3) - (band->mb_size >> 3),
++                                      !ctx->is_indeo4);
+             if (result < 0)
+                 break;
+             ff_dlog(avctx, "Empty tile encountered!\n");
+@@ -1068,6 +1098,51 @@ static int decode_band(IVI45DecContext *ctx,
+     return result;
+ }
+ 
++/*
++ * Intel's decoder (IR50_32.DLL FUN_1003eaf0, FUN_10034040) synthesises a
++ * scalable luma plane with transparency only inside the bounding box of the
++ * transparency rectangles: rows from the even row at or above its top,
++ * columns widened to multiples of 32, and the box borders are treated like
++ * picture edges. Redo that region so that the opaque pixels match.
++ */
++static int recompose_transp_rect(IVI45DecContext *ctx, uint8_t *dst, ptrdiff_t dst_pitch)
++{
++    const IVIPlaneDesc *plane = &ctx->planes[0];
++    IVIPlaneDesc sub = *plane;
++    IVIBandDesc bands[4];
++    int x = ctx->transp_rect[0], y = ctx->transp_rect[1];
++    int x1 = FFMIN(x + ctx->transp_rect[2], plane->width);
++    int y1 = FFMIN(y + ctx->transp_rect[3], plane->height);
++    int c0, c1, r0, w, h;
++    uint8_t *tmp;
++
++    if (x >= x1 || y >= y1)
++        return 0;
++    r0 = y & ~1;
++    c0 = x & ~31;
++    c1 = FFALIGN(x1, 32);
++    w  = c1 - c0;
++    h  = y1 - r0;
++    if (c1 / 2 > plane->bands[0].pitch)
++        return 0;
++    tmp = av_malloc(w * (h + 1));
++    if (!tmp)
++        return AVERROR(ENOMEM);
++    sub.width  = w;
++    sub.height = h;
++    sub.bands  = bands;
++    for (int b = 0; b < 4; b++) {
++        bands[b]     = plane->bands[b];
++        bands[b].buf = plane->bands[b].buf + (r0 >> 1) * plane->bands[b].pitch + (c0 >> 1);
++        /* Synthesis bounds are relative to the shifted band origin. */
++    }
++    ff_ivi_recompose53(&sub, tmp, w, ctx->scalar_synthesis ? 3 : 4);
++    for (int j = 0; j < h; j++)
++        memcpy(dst + (r0 + j) * dst_pitch + c0, tmp + j * w, FFMIN(c1, plane->width) - c0);
++    av_free(tmp);
++    return 0;
++}
++
+ int ff_ivi_decode_frame(AVCodecContext *avctx, AVFrame *frame,
+                         int *got_frame, AVPacket *avpkt)
+ {
+@@ -1102,10 +1177,53 @@ int ff_ivi_decode_frame(AVCodecContext *avctx, AVFrame *frame,
+         return buf_size;
+     }
+ 
+-    if (ctx->gop_flags & IVI5_IS_PROTECTED) {
++    if ((ctx->gop_flags & IVI5_IS_PROTECTED) && ctx->is_indeo4) {
+         avpriv_report_missing_feature(avctx, "Password-protected clip");
+         return AVERROR_PATCHWELCOME;
+     }
++    if (ctx->gop_flags & IVI5_IS_PROTECTED) {
++        if (ctx->access_key < 0) {
++            av_log(avctx, AV_LOG_ERROR, "Clip is protected with an access key; "
++                   "set the decoder option access_key\n");
++            return AVERROR(EINVAL);
++        }
++        if (!ctx->frame_type) {
++            /* key frame: verify the lock word (a function of the key and the
++             * frame checksum, as in Intel's IR50_32.DLL), then descramble the
++             * start of the first band in a copy of the packet */
++            uint32_t k = ctx->access_key, cs = ctx->checksum, a = k & 0xFF;
++            uint32_t t = (a * 256 + 1 + (k >> 16)) * ((k & 0xFF00) + 1 + cs);
++            uint32_t u = t / (t % (a + 1) + 1);
++            uint32_t mult = ((((k >> 8) & 0xFF) + (k & 0xFF) * 256) >> 1) + 0x4000;
++            uint32_t x = ~k >> 16;
++            int pos = get_bits_count(&ctx->gb), band = pos >> 3, n;
++
++            if ((u % ((cs & 0xFF00) + 1) + 1) * u != ctx->lock_word) {
++                av_log(avctx, AV_LOG_ERROR, "Wrong access key\n");
++                return AVERROR_INVALIDDATA;
++            }
++            if (band + 4 > buf_size || !(ctx->frame_flags & 0x80))
++                return AVERROR_INVALIDDATA;
++            n = AV_RL24(buf + band + 1);
++            n = n < 0x44 ? (n - 4) & ~1 : 0x40;
++            if (n < 0 || band + 4 + n > buf_size)
++                return AVERROR_INVALIDDATA;
++            av_fast_padded_malloc(&ctx->prot_buf, &ctx->prot_buf_size, buf_size);
++            if (!ctx->prot_buf)
++                return AVERROR(ENOMEM);
++            memcpy(ctx->prot_buf, buf, buf_size);
++            mult = mult / 200 * 200 + 0x15;
++            for (int i = 0; i < n; i += 2) {
++                x = (mult * x + 1) & 0xFFFF;
++                ctx->prot_buf[band + 4 + i]     ^= x;
++                ctx->prot_buf[band + 4 + i + 1] ^= x >> 8;
++            }
++            if ((result = init_get_bits8(&ctx->gb, ctx->prot_buf, buf_size)) < 0)
++                return result;
++            skip_bits_long(&ctx->gb, pos);
++            ctx->frame_data = ctx->prot_buf;
++        }
++    }
+ 
+     if (!ctx->planes[0].bands) {
+         av_log(avctx, AV_LOG_ERROR, "Color planes not initialized yet\n");
+@@ -1128,7 +1246,8 @@ int ff_ivi_decode_frame(AVCodecContext *avctx, AVFrame *frame,
+         }
+         ctx->buf_invalid[ctx->dst_buf] = 0;
+     } else {
+-        if (ctx->is_scalable)
++        /* Intel's Indeo 5 decoder accepts NULL frames in scalable streams */
++        if (ctx->is_scalable && ctx->is_indeo4)
+             return AVERROR_INVALIDDATA;
+ 
+         for (p = 0; p < 3; p++) {
+@@ -1139,6 +1258,33 @@ int ff_ivi_decode_frame(AVCodecContext *avctx, AVFrame *frame,
+     if (ctx->buf_invalid[ctx->dst_buf])
+         return -1;
+ 
++    /* Indeo 5 transparency plane (follows the last band): only the bounding
++     * box of its rectangles is used here, see recompose_transp_rect() */
++    ctx->transp_rect_valid = 0;
++    if (!ctx->is_indeo4 && ctx->is_scalable && (ctx->gop_flags & 8) &&
++        ctx->is_nonnull_frame(ctx)) {
++        GetBitContext gb = ctx->gb;
++        int i, n, x0 = INT_MAX, y0 = INT_MAX, x1 = 0, y1 = 0;
++        if (ctx->frame_flags & 1)
++            skip_bits_long(&gb, 24);
++        n = get_bits(&gb, 3);
++        for (i = 0; i < n && get_bits_left(&gb) >= 64; i++) {
++            int x = get_bits(&gb, 16), y = get_bits(&gb, 16);
++            int w = get_bits(&gb, 16), h = get_bits(&gb, 16);
++            x0 = FFMIN(x0, x);
++            y0 = FFMIN(y0, y);
++            x1 = FFMAX(x1, x + w);
++            y1 = FFMAX(y1, y + h);
++        }
++        if (i && i == n) {
++            ctx->transp_rect[0] = x0;
++            ctx->transp_rect[1] = y0;
++            ctx->transp_rect[2] = x1 - x0;
++            ctx->transp_rect[3] = y1 - y0;
++            ctx->transp_rect_valid = 1;
++        }
++    }
++
+     if (!ctx->is_nonnull_frame(ctx))
+         return buf_size;
+ 
+@@ -1152,8 +1298,15 @@ int ff_ivi_decode_frame(AVCodecContext *avctx, AVFrame *frame,
+     if (ctx->is_scalable) {
+         if (ctx->is_indeo4)
+             ff_ivi_recompose_haar(&ctx->planes[0], frame->data[0], frame->linesize[0]);
+-        else
+-            ff_ivi_recompose53   (&ctx->planes[0], frame->data[0], frame->linesize[0]);
++        else {
++            ff_ivi_recompose53   (&ctx->planes[0], frame->data[0], frame->linesize[0],
++                                   ctx->scalar_synthesis ? 3 : 4);
++            if (ctx->transp_rect_valid) {
++                result = recompose_transp_rect(ctx, frame->data[0], frame->linesize[0]);
++                if (result < 0)
++                    return result;
++            }
++        }
+     } else {
+         ivi_output_plane(&ctx->planes[0], frame->data[0], frame->linesize[0]);
+     }
+@@ -1224,6 +1377,7 @@ av_cold int ff_ivi_decode_close(AVCodecContext *avctx)
+         ff_vlc_free(&ctx->blk_vlc.cust_tab);
+ 
+     av_frame_free(&ctx->p_frame);
++    av_freep(&ctx->prot_buf);
+ 
+     return 0;
+ }
+diff --git a/libavcodec/ivi.h b/libavcodec/ivi.h
+index afc3ec2..01da73c 100644
+--- a/libavcodec/ivi.h
++++ b/libavcodec/ivi.h
+@@ -210,6 +210,11 @@ typedef struct IVIPicConfig {
+ } IVIPicConfig;
+ 
+ typedef struct IVI45DecContext {
++    const AVClass   *class;          ///< options (Indeo 5 access key)
++    int             scalar_synthesis; ///< omit HH to match Intel's scalar synthesis
++    int64_t         access_key;      ///< key for protected clips, -1 = none
++    uint8_t         *prot_buf;       ///< descrambled copy of a protected key frame
++    unsigned        prot_buf_size;
+     GetBitContext   gb;
+     RVMapDesc       rvmap_tabs[9];   ///< local corrected copy of the static rvmap tables
+ 
+@@ -250,6 +255,8 @@ typedef struct IVI45DecContext {
+     int             show_indeo4_info;
+     uint8_t         has_b_frames;
+     uint8_t         has_transp;      ///< transparency mode status: 1 - enabled
++    int             transp_rect[4];  ///< union of the transparency rectangles: x, y, w, h
++    uint8_t         transp_rect_valid;
+     uint8_t         uses_tiling;
+     uint8_t         uses_haar;
+     uint8_t         uses_fullpel;
+diff --git a/libavcodec/ivi_dsp.c b/libavcodec/ivi_dsp.c
+index d711156..867f17b 100644
+--- a/libavcodec/ivi_dsp.c
++++ b/libavcodec/ivi_dsp.c
+@@ -31,16 +31,138 @@
+ #include "ivi.h"
+ #include "ivi_dsp.h"
+ 
++/* Intel's scalar filter packs columns eight band samples apart into a
++ * uint32_t. Its additions and shifts intentionally carry between the lanes;
++ * evaluating the same filter as independent signed samples loses those rare
++ * rounding effects. Recreate its biased 4x coefficient representation and
++ * operation order, with defined unsigned wraparound (FUN_10032bf8). */
++static uint32_t ivi_scalar_pair(const int16_t *row, int x0, int x1)
++{
++    return ((row[x0] * 4 + 0x4000) & 0xffff) |
++           (uint32_t)((row[x1] * 4 + 0x4000) & 0xffff) << 16;
++}
++
++static uint32_t ivi_scalar_clip(uint32_t value, int ll_pixel)
++{
++    uint32_t mask = ll_pixel ? (value >> 10) & 0xfff00030U :
++                               (value & 0xc000c000U) >> 10;
++    uint32_t result;
++
++    mask += 0x3ff03ff0U;
++    result = value & mask;
++    mask = (mask | 0x7fc07fc0U) - 0x3fd03fd0U;
++    return (result | mask) >> 6;
++}
++
++static void ivi_recompose53_scalar(const IVIPlaneDesc *plane, uint8_t *dst,
++                                  ptrdiff_t dst_pitch)
++{
++    const int width = FFALIGN(plane->width, 32) / 2;
++    const int height = (plane->height + 1) / 2;
++    const ptrdiff_t pitch = plane->bands[0].pitch;
++    const uint32_t bias = 0x1fff2000U;
++    int y, group, i, lane;
++
++    for (y = 0; y < height; y++) {
++        int below = FFMIN(y + 1, height - 1);
++        int above = FFMAX(y - 1, 0);
++        int high_below = y + 1 < height ? y + 1 : above;
++        const int16_t *ll = plane->bands[0].buf + y * pitch;
++        const int16_t *lld = plane->bands[0].buf + below * pitch;
++        const int16_t *hl = plane->bands[1].buf + y * pitch;
++        const int16_t *hlu = plane->bands[1].buf + above * pitch;
++        const int16_t *hld = plane->bands[1].buf + high_below * pitch;
++        const int16_t *lh = plane->bands[2].buf + y * pitch;
++        const int16_t *lhd = plane->bands[2].buf + below * pitch;
++
++        for (group = 0; group < width; group += 16) {
++            for (i = 0; i < 8; i++) {
++                int x0 = group + i, x1 = x0 + 8;
++                int l0 = FFMAX(x0 - 1, 0), l1 = x1 - 1;
++                int r0 = x0 + 1, r1 = FFMIN(x1 + 1, width - 1);
++                uint32_t a = ivi_scalar_pair(ll, x0, x1);
++                uint32_t b = ivi_scalar_pair(ll, r0, r1);
++                uint32_t c = ivi_scalar_pair(lld, x0, x1);
++                uint32_t d = ivi_scalar_pair(lld, r0, r1);
++                uint32_t hu = ivi_scalar_pair(hlu, x0, x1);
++                uint32_t h = ivi_scalar_pair(hl, x0, x1);
++                uint32_t hd = ivi_scalar_pair(hld, x0, x1);
++                uint32_t hur = ivi_scalar_pair(hlu, r0, r1);
++                uint32_t hr = ivi_scalar_pair(hl, r0, r1);
++                uint32_t hdr = ivi_scalar_pair(hld, r0, r1);
++                uint32_t kl = ivi_scalar_pair(lh, l0, l1);
++                uint32_t k = ivi_scalar_pair(lh, x0, x1);
++                uint32_t kr = ivi_scalar_pair(lh, r0, r1);
++                uint32_t kld = ivi_scalar_pair(lhd, l0, l1);
++                uint32_t kd = ivi_scalar_pair(lhd, x0, x1);
++                uint32_t krd = ivi_scalar_pair(lhd, r0, r1);
++                uint32_t p0, p1, p2, p3;
++
++                p0 = bias + 4*a + 2*(hu+h) - 0x10000U +
++                     2*(kl+k) - 0x10000U;
++                p1 = bias + 2*a + 2*b + hu+h+hr+hur - 0x10000U +
++                     kl + 2*((kr >> 1) - 3*k) + 0x10000U;
++                p2 = bias + 2*a + 2*c + 2*((hu+hd) >> 1) + 0x10000U -
++                     6*h + 2*((kl+kld) >> 1) + k+kd + 0x10000U;
++                /* The final pair in each group uses the lane-crossing loop,
++                 * whose horizontal sum carries a different guard bias. */
++                if (i == 7)
++                    p2 -= 0x20000U;
++                p3 = bias + a+b+c+d + ((hu+hd) >> 1) - 3*h - 3*hr +
++                     ((hur+hdr) >> 1) + 0x10000U + ((kl+kld) >> 1) +
++                     0x10000U - 3*kd + (kr >> 1) - 3*k + (krd >> 1);
++                p0 = ivi_scalar_clip(p0, 1);
++                p1 = ivi_scalar_clip(p1, 0);
++                p2 = ivi_scalar_clip(p2, 0);
++                p3 = ivi_scalar_clip(p3, 0);
++
++                for (lane = 0; lane < 2; lane++) {
++                    int x = 2 * (lane ? x1 : x0);
++                    int shift = lane * 16;
++                    if (x >= plane->width)
++                        continue;
++                    dst[x] = (p0 >> shift) & 0xff;
++                    if (x + 1 < plane->width)
++                        dst[x + 1] = (p1 >> shift) & 0xff;
++                    if (2*y + 1 < plane->height) {
++                        dst[dst_pitch+x] = (p2 >> shift) & 0xff;
++                        if (x + 1 < plane->width)
++                            dst[dst_pitch+x+1] = (p3 >> shift) & 0xff;
++                    }
++                }
++            }
++        }
++        if (plane->width == width * 2) {
++            dst[plane->width - 1] = dst[plane->width - 2];
++            if (2*y + 1 < plane->height)
++                dst[dst_pitch+plane->width - 1] = dst[dst_pitch+plane->width - 2];
++        }
++        dst += 2 * dst_pitch;
++    }
++}
++
+ void ff_ivi_recompose53(const IVIPlaneDesc *plane, uint8_t *dst,
+-                        const ptrdiff_t dst_pitch)
++                        const ptrdiff_t dst_pitch, int num_bands)
+ {
+     int             x, y, indx;
+     int32_t         p0, p1, p2, p3, tmp0, tmp1, tmp2;
+     int32_t         b0_1, b0_2, b1_1, b1_2, b1_3, b2_1, b2_2, b2_3, b2_4, b2_5, b2_6;
+     int32_t         b3_1, b3_2, b3_3, b3_4, b3_5, b3_6, b3_7, b3_8, b3_9;
+-    ptrdiff_t       pitch, back_pitch;
++    ptrdiff_t       pitch, back_pitch, hpf_pitch;
+     const short     *b0_ptr, *b1_ptr, *b2_ptr, *b3_ptr;
+-    const int       num_bands = 4;
++    /* Intel's MMX path includes HH; its scalar path omits it. The caller
++     * selects the matching synthesis rather than inferring CPU behavior
++     * from the stream, which has the same four-band layout in both cases. */
++    /* Intel's synthesis viewport is rounded to 32 pixels in FUN_10034040.
++     * A partial final viewport therefore uses the coded band padding rather
++     * than treating the visible picture width as the right filter boundary. */
++    const int       synth_width = FFALIGN(plane->width, 32);
++    const int       right_edge = plane->width == synth_width;
++
++    if (num_bands == 3) {
++        ivi_recompose53_scalar(plane, dst, dst_pitch);
++        return;
++    }
+ 
+     /* all bands should have the same pitch */
+     pitch = plane->bands[0].pitch;
+@@ -56,8 +178,13 @@ void ff_ivi_recompose53(const IVIPlaneDesc *plane, uint8_t *dst,
+ 
+     for (y = 0; y < plane->height; y += 2) {
+ 
+-        if (y+2 >= plane->height)
+-            pitch= 0;
++        /* Below the last band row the low bands are replicated, the
++         * vertically high-passed bands mirrored (as in the Intel decoder). */
++        hpf_pitch = pitch;
++        if (y+2 >= plane->height) {
++            pitch     = 0;
++            hpf_pitch = back_pitch;
++        }
+         /* load storage variables with values */
+         if (num_bands > 0) {
+             b0_1 = b0_ptr[0];
+@@ -67,7 +194,7 @@ void ff_ivi_recompose53(const IVIPlaneDesc *plane, uint8_t *dst,
+         if (num_bands > 1) {
+             b1_1 = b1_ptr[back_pitch];
+             b1_2 = b1_ptr[0];
+-            b1_3 = b1_1 - b1_2*6 + b1_ptr[pitch];
++            b1_3 = b1_1 - b1_2*6 + b1_ptr[hpf_pitch];
+         }
+ 
+         if (num_bands > 2) {
+@@ -82,12 +209,12 @@ void ff_ivi_recompose53(const IVIPlaneDesc *plane, uint8_t *dst,
+             b3_3 = b3_2;               // b3[x+1,y-1] = b3[x  ,y-1]
+             b3_5 = b3_ptr[0];          // b3[x  ,y  ]
+             b3_6 = b3_5;               // b3[x+1,y  ] = b3[x  ,y  ]
+-            b3_8 = b3_2 - b3_5*6 + b3_ptr[pitch];
++            b3_8 = b3_2 - b3_5*6 + b3_ptr[hpf_pitch];
+             b3_9 = b3_8;
+         }
+ 
+         for (x = 0, indx = 0; x < plane->width; x+=2, indx++) {
+-            if (x+2 >= plane->width) {
++            if (x+2 >= synth_width) {
+                 b0_ptr --;
+                 b1_ptr --;
+                 b2_ptr --;
+@@ -130,8 +257,8 @@ void ff_ivi_recompose53(const IVIPlaneDesc *plane, uint8_t *dst,
+                 b1_2 = b1_ptr[indx+1];
+                 b1_1 = b1_ptr[back_pitch+indx+1];
+ 
+-                tmp2 = tmp1 - tmp0*6 + b1_3;
+-                b1_3 = b1_1 - b1_2*6 + b1_ptr[pitch+indx+1];
++                tmp2 = b1_3; /* vertical HPF at column x, computed in the previous iteration */
++                b1_3 = b1_1 - b1_2*6 + b1_ptr[hpf_pitch+indx+1];
+ 
+                 p0 += (tmp0 + tmp1) * 8;
+                 p1 += (tmp0 + tmp1 + b1_1 + b1_2) * 4;
+@@ -162,7 +289,7 @@ void ff_ivi_recompose53(const IVIPlaneDesc *plane, uint8_t *dst,
+                 tmp1 = b3_2 + b3_5;
+                 tmp2 = b3_3 + b3_6;
+ 
+-                b3_9 = b3_3 - b3_6*6 + b3_ptr[pitch+indx+1];
++                b3_9 = b3_3 - b3_6*6 + b3_ptr[hpf_pitch+indx+1];
+ 
+                 p0 += (tmp0 + tmp1) * 4;
+                 p1 += (tmp0 - tmp1*6 + tmp2) * 2;
+@@ -177,14 +304,21 @@ void ff_ivi_recompose53(const IVIPlaneDesc *plane, uint8_t *dst,
+             dst[dst_pitch+x+1] = av_clip_uint8((p3 >> 6) + 128);
+         }// for x
+ 
++        /* The Intel decoder replaces the last (odd) column of each row with
++         * the one before it. */
++        if (right_edge) {
++            dst[plane->width - 1]             = dst[plane->width - 2];
++            dst[dst_pitch + plane->width - 1] = dst[dst_pitch + plane->width - 2];
++        }
++
+         dst += dst_pitch << 1;
+ 
+         back_pitch = -pitch;
+ 
+-        b0_ptr += pitch + 1;
+-        b1_ptr += pitch + 1;
+-        b2_ptr += pitch + 1;
+-        b3_ptr += pitch + 1;
++        b0_ptr += pitch + right_edge;
++        b1_ptr += pitch + right_edge;
++        b2_ptr += pitch + right_edge;
++        b3_ptr += pitch + right_edge;
+     }
+ }
+ 
+diff --git a/libavcodec/ivi_dsp.h b/libavcodec/ivi_dsp.h
+index 2704d2b..ae94abe 100644
+--- a/libavcodec/ivi_dsp.h
++++ b/libavcodec/ivi_dsp.h
+@@ -40,9 +40,10 @@
+  *  @param[in]   plane        pointer to the descriptor of the plane being processed
+  *  @param[out]  dst          pointer to the destination buffer
+  *  @param[in]   dst_pitch    pitch of the destination buffer
++ *  @param[in]   num_bands    4 for Intel MMX synthesis, 3 for scalar compatibility
+  */
+ void ff_ivi_recompose53(const IVIPlaneDesc *plane, uint8_t *dst,
+-                        const ptrdiff_t dst_pitch);
++                        const ptrdiff_t dst_pitch, int num_bands);
+ 
+ /**
+  *  Haar wavelet recomposition filter for Indeo 4
