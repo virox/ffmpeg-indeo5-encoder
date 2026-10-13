@@ -1,0 +1,27 @@
+# FFmpeg checkout: apply indeo5enc.patch on top of the commit named in README.md
+ffmpeg/
+
+# Proprietary Intel binaries and material derived from them
+*.DLL
+*.dll
+re/ir50_32_decomp.c
+re/*.rea-snapshot
+re/ghidra_proj/
+re/ghidra.log
+re/enc/
+re/thomas/
+re/indeo_help.pdf
+re/vfw_head.htm
+
+# Copyrighted media, generated output, logs, build artefacts
+samples/
+sources/
+out/
+*.log
+__pycache__/
+tools/iv5ref/iv5ref
+re/indeo_help.txt
+re/vfw_head.txt
+re/ir50_typelib.tlb
+re/typelib.bin.txt
+re/ir50_32_resources.txt
